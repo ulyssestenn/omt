@@ -25,6 +25,11 @@ TEMPERATURE_MAX = 2.0
 TEMPERATURE_DEFAULT = 0.8
 INVALID_TEMPERATURE = object()
 
+# Fields dropped from the saved Ollama metadata: ``context`` is a large array of
+# token IDs only useful for resuming a conversation, and ``response`` duplicates
+# the answer already written above it as the run output.
+SAVED_METADATA_OMIT_KEYS = frozenset({"context", "response"})
+
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
@@ -560,14 +565,14 @@ def write_model_output_file(
             ]
         )
         if result["ok"]:
-            raw_metadata = json.dumps(result["raw"], indent=2, sort_keys=True)
+            metadata_json = json.dumps(saved_metadata(result["raw"]), indent=2, sort_keys=True)
             lines.extend(
                 [
                     result["response"].rstrip(),
                     "",
-                    "### Raw Ollama metadata",
+                    "### Ollama metadata",
                     "",
-                    markdown_fence_block(raw_metadata, "json"),
+                    markdown_fence_block(metadata_json, "json"),
                     "",
                 ]
             )
@@ -582,6 +587,10 @@ def markdown_fence_block(value: str, language: str = "") -> str:
     fence = "`" * max(3, longest_backtick_run + 1)
     suffix = language if language else ""
     return f"{fence}{suffix}\n{value}\n{fence}"
+
+
+def saved_metadata(raw: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in raw.items() if key not in SAVED_METADATA_OMIT_KEYS}
 
 
 def append_metadata_run(
