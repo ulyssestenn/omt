@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Run the same prompt against a local Ollama model and save the outputs."""
+"""Run the same prompt against a local Ollama model and save the outputs.
+
+This is a small, dependency-free CLI for comparing Ollama models. It asks which
+installed model to use, takes a prompt, runs it one or more times, and writes
+each model's responses (plus Ollama's timing and token metadata) to a Markdown
+file under ``ollama-runs/``. Every choice can also be supplied as a command-line
+flag for non-interactive use.
+
+High-level flow (see ``main``): list installed models -> gather the model,
+prompt, run count, and options -> run the prompt N times -> save the outputs and
+update the prompt's ``metadata.json``. See the README for a fuller walkthrough.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +34,9 @@ OUTPUT_ROOT = Path("ollama-runs")
 TEMPERATURE_MIN = 0.0
 TEMPERATURE_MAX = 2.0
 TEMPERATURE_DEFAULT = 0.8
+
+# Sentinel returned for an invalid --temperature, so callers can tell a bad value
+# apart from None (which means "let Ollama use its own default").
 INVALID_TEMPERATURE = object()
 
 # Fields dropped from the saved Ollama metadata: ``context`` is a large array of
@@ -32,12 +46,14 @@ SAVED_METADATA_OMIT_KEYS = frozenset({"context", "response"})
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the full interactive flow and return a process exit code (0 = success)."""
     args = parse_args(argv)
 
     print("Ollama model tester")
     print("===================")
     print()
 
+    # Ask Ollama which models are installed locally (requires the server running).
     try:
         models = list_ollama_models()
     except RuntimeError as exc:
@@ -49,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
         print("No local Ollama models found. Install one with `ollama pull <model>`.")
         return 1
 
+    # Gather everything a run needs, taking each value from its CLI flag when
+    # given and falling back to an interactive prompt otherwise.
     model = resolve_model(args.model, models)
     if model is None:
         return 1
@@ -73,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
 
     stream = resolve_stream(args.stream)
 
+    # Set up the output folder (one per unique prompt) and write the prompt file
+    # once, so repeated runs of the same prompt share it.
     run_dir = create_prompt_run_dir(prompt)
     prompt_path = run_dir / "prompt.md"
     metadata_path = run_dir / "metadata.json"
@@ -86,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Saving results to: {run_dir}")
     print()
 
+    # Run the prompt the requested number of times, collecting each result.
     results: list[dict[str, Any]] = []
     for index in range(1, runs + 1):
         print(f"Run {index}/{runs} using {model}...")
@@ -95,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         elapsed = result["elapsed_seconds"]
         print(f"  {status} in {elapsed:.2f}s")
 
+    # Save this model's outputs and append the batch to the prompt's metadata.
     finished_at = now_local()
     write_model_output_file(output_path, model, prompt, results, options, stream, started_at)
     append_metadata_run(
@@ -121,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Define and parse the command-line flags (each one has an interactive fallback)."""
     parser = argparse.ArgumentParser(
         description="Run the same prompt against a local Ollama model and save the outputs."
     )
@@ -149,6 +172,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "If omitted, enter the prompt interactively."
         ),
     )
+    # --stream and --no-stream share a destination; the default of None lets
+    # resolve_stream() tell "flag not given" apart from an explicit choice.
     stream_group = parser.add_mutually_exclusive_group()
     stream_group.add_argument(
         "--stream",
@@ -167,6 +192,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def resolve_model(requested_model: str | None, models: list[str]) -> str | None:
+    """Pick the model: use ``--model`` if it is installed, else ask interactively.
+
+    Returns ``None`` (after listing what is available) when a requested model is
+    not installed locally.
+    """
     if requested_model is None:
         return choose_model(models)
 
@@ -181,6 +211,10 @@ def resolve_model(requested_model: str | None, models: list[str]) -> str | None:
 
 
 def resolve_prompt(prompt_file: Path | None) -> str | None:
+    """Read the prompt from ``--prompt-file`` if given, otherwise ask for it.
+
+    Returns ``None`` if the given file cannot be read.
+    """
     if prompt_file is None:
         return read_multiline_prompt()
 
@@ -192,6 +226,7 @@ def resolve_prompt(prompt_file: Path | None) -> str | None:
 
 
 def resolve_runs(requested_runs: int | None) -> int | None:
+    """Return the run count from ``--runs`` or ask for it; ``None`` means invalid input."""
     if requested_runs is None:
         return ask_positive_int("How many times should this prompt be run? ")
 
@@ -203,6 +238,11 @@ def resolve_runs(requested_runs: int | None) -> int | None:
 
 
 def resolve_temperature(requested_temperature: float | None) -> float | object | None:
+    """Resolve the temperature to use for generation.
+
+    Returns a float to use, ``None`` to fall back to Ollama's own default, or the
+    ``INVALID_TEMPERATURE`` sentinel when an out-of-range ``--temperature`` was given.
+    """
     if requested_temperature is None:
         return ask_optional_temperature()
 
@@ -221,12 +261,14 @@ def resolve_temperature(requested_temperature: float | None) -> float | object |
 
 
 def resolve_stream(requested_stream: bool | None) -> bool:
+    """Decide streaming from the flag, or ask yes/no when neither flag was given."""
     if requested_stream is None:
         return ask_yes_no("Stream responses from /api/generate?", default=False)
     return requested_stream
 
 
 def read_multiline_prompt() -> str:
+    """Collect a multi-line prompt from stdin until a line reads ``/done``."""
     print("Enter the prompt. Put /done on its own line when finished.")
     print()
     lines: list[str] = []
@@ -244,6 +286,7 @@ def read_multiline_prompt() -> str:
 
 
 def list_ollama_models() -> list[str]:
+    """Return the installed model names, sorted, via Ollama's ``/api/tags`` endpoint."""
     payload = ollama_get_json("/api/tags")
     models = payload.get("models", [])
     names = [item.get("name") for item in models if item.get("name")]
@@ -251,6 +294,7 @@ def list_ollama_models() -> list[str]:
 
 
 def choose_model(models: list[str]) -> str:
+    """Print a numbered menu and return the model the user selects."""
     print()
     print("Available local models:")
     for index, model in enumerate(models, start=1):
@@ -271,6 +315,7 @@ def choose_model(models: list[str]) -> str:
 
 
 def ask_positive_int(question: str) -> int:
+    """Prompt repeatedly until the user enters a positive whole number."""
     while True:
         answer = input(question).strip()
         if answer.isdigit() and int(answer) > 0:
@@ -279,6 +324,7 @@ def ask_positive_int(question: str) -> int:
 
 
 def ask_optional_float(question: str) -> float | None:
+    """Prompt for a finite float, or return ``None`` if the user just presses Enter."""
     while True:
         answer = input(question).strip()
         if not answer:
@@ -296,6 +342,7 @@ def ask_optional_float(question: str) -> float | None:
 
 
 def ask_yes_no(question: str, default: bool = False) -> bool:
+    """Prompt for yes/no, returning ``default`` on an empty answer."""
     suffix = "[Y/n]" if default else "[y/N]"
     while True:
         answer = input(f"{question} {suffix} ").strip().lower()
@@ -310,6 +357,7 @@ def ask_yes_no(question: str, default: bool = False) -> bool:
 
 
 def ask_optional_temperature() -> float | None:
+    """Ask for a temperature within range, or ``None`` to use Ollama's default."""
     question = (
         f"Temperature to use ({TEMPERATURE_MIN:.1f} to {TEMPERATURE_MAX:.1f}), "
         f"or press Enter for Ollama default ({TEMPERATURE_DEFAULT:.1f}): "
@@ -329,6 +377,11 @@ def ask_optional_temperature() -> float | None:
 
 
 def create_prompt_run_dir(prompt: str) -> Path:
+    """Create and return the output folder for a prompt, named ``<slug>_<hash8>``.
+
+    Keying the folder on the prompt means re-running the same prompt with a
+    different model collects every model's output side by side in one place.
+    """
     slug = prompt_slug(prompt)
     digest = prompt_hash(prompt)[:8]
     run_dir = OUTPUT_ROOT / f"{slug}_{digest}"
@@ -337,6 +390,7 @@ def create_prompt_run_dir(prompt: str) -> Path:
 
 
 def prompt_slug(prompt: str, max_words: int = 6) -> str:
+    """Build a short, filesystem-safe slug from the first few words of the prompt."""
     words = re.findall(r"[A-Za-z0-9]+", prompt.lower())
     if not words:
         return "prompt"
@@ -344,6 +398,7 @@ def prompt_slug(prompt: str, max_words: int = 6) -> str:
 
 
 def prompt_preview(prompt: str, max_chars: int = 160) -> str:
+    """Return a one-line, whitespace-collapsed preview of the prompt for metadata."""
     compact = re.sub(r"\s+", " ", prompt).strip()
     if len(compact) <= max_chars:
         return compact
@@ -351,15 +406,22 @@ def prompt_preview(prompt: str, max_chars: int = 160) -> str:
 
 
 def prompt_hash(prompt: str) -> str:
+    """Return the SHA-256 hex digest of the prompt (used to key its folder and files)."""
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
 
 def safe_name(value: str) -> str:
+    """Turn a model name into a filename-safe string (e.g. ``llama3.1:8b`` -> ``llama3.1-8b``)."""
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value)
     return cleaned.strip("-") or "model"
 
 
 def unique_model_output_path(run_dir: Path, model: str) -> Path:
+    """Return ``<model>.md`` in ``run_dir``, adding ``-2``, ``-3`` ... to avoid overwriting.
+
+    This lets the same model be run against one prompt more than once without
+    clobbering the earlier output file.
+    """
     base_name = safe_name(model)
     path = run_dir / f"{base_name}.md"
     if not path.exists():
@@ -379,6 +441,13 @@ def generate_once(
     options: dict[str, Any],
     stream: bool = False,
 ) -> dict[str, Any]:
+    """Run a single generation and return a result dict.
+
+    The result always has ``ok``, ``generated_at``, and ``elapsed_seconds``; on
+    success it also carries ``response`` and the raw Ollama payload under
+    ``raw``, and on failure an ``error`` message instead. Failures are captured
+    rather than raised so one bad run does not abort the whole batch.
+    """
     started = time.monotonic()
     generated_at = now_local()
 
@@ -417,11 +486,13 @@ def generate_once(
 
 
 def ollama_get_json(path: str) -> dict[str, Any]:
+    """GET ``path`` from the Ollama server and return the parsed JSON object."""
     request = urllib.request.Request(f"{OLLAMA_HOST}{path}", method="GET")
     return open_json_request(request)
 
 
 def ollama_post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """POST a JSON ``payload`` to ``path`` and return the parsed JSON response."""
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         f"{OLLAMA_HOST}{path}",
@@ -437,6 +508,13 @@ def ollama_post_stream_json(
     payload: dict[str, Any],
     response_output: TextIO | None = None,
 ) -> dict[str, Any]:
+    """POST to ``path`` and consume Ollama's streamed, newline-delimited JSON.
+
+    Each line is one chunk. The chunks' ``response`` fragments are echoed to
+    ``response_output`` (stdout by default) as they arrive and concatenated into
+    the full text. Returns the final chunk -- which carries the timing/token
+    stats -- with its ``response`` replaced by that reassembled text.
+    """
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         f"{OLLAMA_HOST}{path}",
@@ -494,6 +572,7 @@ def ollama_post_stream_json(
 
 
 def open_json_request(request: urllib.request.Request) -> dict[str, Any]:
+    """Send a prepared request and return parsed JSON, mapping failures to RuntimeError."""
     try:
         with urllib.request.urlopen(request, timeout=600) as response:
             body = response.read().decode("utf-8")
@@ -512,6 +591,7 @@ def open_json_request(request: urllib.request.Request) -> dict[str, Any]:
 
 
 def write_prompt_file(path: Path, prompt: str, started_at: dt.datetime) -> None:
+    """Write the shared ``prompt.md`` for a run folder (prompt text, hash, and date)."""
     path.write_text(
         "\n".join(
             [
@@ -537,6 +617,7 @@ def write_model_output_file(
     stream: bool,
     started_at: dt.datetime,
 ) -> None:
+    """Write one model's ``<model>.md``: a header followed by each run's response and metadata."""
     lines = [
         "# Ollama Model Test",
         "",
@@ -583,6 +664,12 @@ def write_model_output_file(
 
 
 def markdown_fence_block(value: str, language: str = "") -> str:
+    """Wrap ``value`` in a fenced code block, widening the fence as needed.
+
+    The fence uses one more backtick than the longest backtick run found inside
+    ``value``, so a prompt or response that itself contains ``` still nests
+    correctly instead of breaking out of the block.
+    """
     longest_backtick_run = max((len(match.group(0)) for match in re.finditer(r"`+", value)), default=0)
     fence = "`" * max(3, longest_backtick_run + 1)
     suffix = language if language else ""
@@ -590,6 +677,10 @@ def markdown_fence_block(value: str, language: str = "") -> str:
 
 
 def saved_metadata(raw: dict[str, Any]) -> dict[str, Any]:
+    """Return the run's metadata with the bulky/duplicate keys removed.
+
+    See ``SAVED_METADATA_OMIT_KEYS`` for which keys are dropped and why.
+    """
     return {key: value for key, value in raw.items() if key not in SAVED_METADATA_OMIT_KEYS}
 
 
@@ -599,6 +690,12 @@ def append_metadata_run(
     prompt: str,
     prompt_file_name: str,
 ) -> None:
+    """Append one run batch to the prompt's ``metadata.json``.
+
+    Reads any existing file, upgrades an older single-run layout via
+    ``legacy_metadata_as_run``, then appends ``run_payload`` to the ``runs`` list
+    so every batch run against this prompt is recorded in one place.
+    """
     if path.exists():
         try:
             metadata = json.loads(path.read_text(encoding="utf-8"))
@@ -626,6 +723,11 @@ def append_metadata_run(
 
 
 def legacy_metadata_as_run(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert a pre-``runs``-list ``metadata.json`` into a single run entry, or ``None``.
+
+    Keeps backward compatibility with run folders written by older versions that
+    stored just one run at the top level instead of a ``runs`` list.
+    """
     required_keys = [
         "model",
         "runs_requested",
@@ -654,6 +756,7 @@ def legacy_metadata_as_run(metadata: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def now_local() -> dt.datetime:
+    """Return the current time as a timezone-aware local ``datetime``."""
     return dt.datetime.now().astimezone()
 
 
