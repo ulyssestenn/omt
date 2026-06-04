@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import re
 import sys
 import time
@@ -17,6 +18,9 @@ from typing import Any
 
 OLLAMA_HOST = "http://localhost:11434"
 OUTPUT_ROOT = Path("ollama-runs")
+TEMPERATURE_MIN = 0.0
+TEMPERATURE_MAX = 2.0
+TEMPERATURE_DEFAULT = 0.8
 
 
 def main() -> int:
@@ -44,9 +48,7 @@ def main() -> int:
 
     runs = ask_positive_int("How many times should this prompt be run? ")
 
-    temperature = ask_optional_float(
-        "Temperature to use, or press Enter for Ollama default: "
-    )
+    temperature = ask_optional_temperature()
     options: dict[str, Any] = {}
     if temperature is not None:
         options["temperature"] = temperature
@@ -155,9 +157,34 @@ def ask_optional_float(question: str) -> float | None:
         if not answer:
             return None
         try:
-            return float(answer)
+            value = float(answer)
         except ValueError:
             print("Enter a number, or press Enter for the default.")
+            continue
+
+        if math.isfinite(value):
+            return value
+
+        print("Enter a finite number, or press Enter for the default.")
+
+
+def ask_optional_temperature() -> float | None:
+    question = (
+        f"Temperature to use ({TEMPERATURE_MIN:.1f} to {TEMPERATURE_MAX:.1f}), "
+        f"or press Enter for Ollama default ({TEMPERATURE_DEFAULT:.1f}): "
+    )
+
+    while True:
+        temperature = ask_optional_float(question)
+        if temperature is None:
+            return None
+        if TEMPERATURE_MIN <= temperature <= TEMPERATURE_MAX:
+            return temperature
+
+        print(
+            "Temperature is outside the expected range "
+            f"({TEMPERATURE_MIN:.1f} to {TEMPERATURE_MAX:.1f}). Please try again."
+        )
 
 
 def create_prompt_run_dir(prompt: str) -> Path:
