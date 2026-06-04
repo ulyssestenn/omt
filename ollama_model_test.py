@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import io
 import json
 import math
 import re
@@ -13,7 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 
 OLLAMA_HOST = "http://localhost:11434"
@@ -53,6 +54,8 @@ def main() -> int:
     if temperature is not None:
         options["temperature"] = temperature
 
+    stream = ask_yes_no("Stream responses from /api/generate?", default=False)
+
     run_dir = create_prompt_run_dir(prompt)
     prompt_path = run_dir / "prompt.md"
     metadata_path = run_dir / "metadata.json"
@@ -69,14 +72,14 @@ def main() -> int:
     results: list[dict[str, Any]] = []
     for index in range(1, runs + 1):
         print(f"Run {index}/{runs} using {model}...")
-        result = generate_once(model, prompt, options)
+        result = generate_once(model, prompt, options, stream=stream)
         results.append(result)
         status = "ok" if result["ok"] else "error"
         elapsed = result["elapsed_seconds"]
         print(f"  {status} in {elapsed:.2f}s")
 
     finished_at = now_local()
-    write_model_output_file(output_path, model, prompt, results, options, started_at)
+    write_model_output_file(output_path, model, prompt, results, options, stream, started_at)
     append_metadata_run(
         metadata_path,
         {
@@ -86,6 +89,7 @@ def main() -> int:
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
             "options": options,
+            "stream": stream,
             "files": {
                 "model_output": output_path.name,
             },
@@ -168,6 +172,20 @@ def ask_optional_float(question: str) -> float | None:
         print("Enter a finite number, or press Enter for the default.")
 
 
+def ask_yes_no(question: str, default: bool = False) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        answer = input(f"{question} {suffix} ").strip().lower()
+        if not answer:
+            return default
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+
+        print("Enter y or n.")
+
+
 def ask_optional_temperature() -> float | None:
     question = (
         f"Temperature to use ({TEMPERATURE_MIN:.1f} to {TEMPERATURE_MAX:.1f}), "
@@ -232,20 +250,29 @@ def unique_model_output_path(run_dir: Path, model: str) -> Path:
         suffix += 1
 
 
-def generate_once(model: str, prompt: str, options: dict[str, Any]) -> dict[str, Any]:
+def generate_once(
+    model: str,
+    prompt: str,
+    options: dict[str, Any],
+    stream: bool = False,
+) -> dict[str, Any]:
     started = time.monotonic()
     generated_at = now_local()
 
     request_payload: dict[str, Any] = {
         "model": model,
         "prompt": prompt,
-        "stream": False,
+        "stream": stream,
     }
     if options:
         request_payload["options"] = options
 
     try:
-        response_payload = ollama_post_json("/api/generate", request_payload)
+        if stream:
+            response_payload = ollama_post_stream_json("/api/generate", request_payload)
+            print()
+        else:
+            response_payload = ollama_post_json("/api/generate", request_payload)
         elapsed = time.monotonic() - started
         return {
             "ok": True,
@@ -255,6 +282,8 @@ def generate_once(model: str, prompt: str, options: dict[str, Any]) -> dict[str,
             "raw": response_payload,
         }
     except RuntimeError as exc:
+        if stream:
+            print()
         elapsed = time.monotonic() - started
         return {
             "ok": False,
@@ -278,6 +307,67 @@ def ollama_post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         headers={"Content-Type": "application/json"},
     )
     return open_json_request(request)
+
+
+def ollama_post_stream_json(
+    path: str,
+    payload: dict[str, Any],
+    response_output: TextIO | None = None,
+) -> dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{OLLAMA_HOST}{path}",
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+
+    if response_output is None:
+        response_output = sys.stdout
+
+    response_buffer = io.StringIO()
+    final_chunk: dict[str, Any] | None = None
+    saw_chunk = False
+    try:
+        with urllib.request.urlopen(request, timeout=600) as response:
+            for line_number, raw_line in enumerate(response, start=1):
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"invalid streaming JSON response on line {line_number}: {line[:200]}"
+                    ) from exc
+
+                if not isinstance(chunk, dict):
+                    raise RuntimeError(f"streaming JSON line {line_number} was not an object")
+
+                saw_chunk = True
+                response_text = chunk.get("response")
+                if isinstance(response_text, str) and response_text:
+                    response_buffer.write(response_text)
+                    response_output.write(response_text)
+                    response_output.flush()
+
+                final_chunk = chunk
+                if chunk.get("done"):
+                    break
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(str(exc.reason)) from exc
+    except TimeoutError as exc:
+        raise RuntimeError("request timed out") from exc
+
+    if not saw_chunk or final_chunk is None:
+        raise RuntimeError("empty streaming response")
+
+    stream_payload = dict(final_chunk)
+    stream_payload["response"] = response_buffer.getvalue()
+    return stream_payload
 
 
 def open_json_request(request: urllib.request.Request) -> dict[str, Any]:
@@ -321,6 +411,7 @@ def write_model_output_file(
     prompt: str,
     results: list[dict[str, Any]],
     options: dict[str, Any],
+    stream: bool,
     started_at: dt.datetime,
 ) -> None:
     lines = [
@@ -331,6 +422,7 @@ def write_model_output_file(
         f"Prompt hash: `{prompt_hash(prompt)}`",
         f"Runs: {len(results)}",
         f"Options: `{json.dumps(options, sort_keys=True)}`",
+        f"Streaming: `{stream}`",
         "",
         "## Prompt",
         "",
