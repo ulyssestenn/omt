@@ -74,3 +74,30 @@ full prompt. Because the folder is keyed on the prompt, **running the same
 prompt against a different model drops its output into the same folder** —
 making model-to-model comparison easy. Each model's file records every run's
 response alongside Ollama's run metadata (token counts, timings, and so on).
+
+## How it works
+
+The whole program is one dependency-free file, `ollama_model_test.py`, built on
+the standard library's `urllib`. `main()` reads top-to-bottom as the high-level
+flow, and each step is a small named function you can jump to:
+
+1. **Discover models** — `list_ollama_models()` calls Ollama's `/api/tags`
+   endpoint and returns the installed model names.
+2. **Gather inputs** — the `resolve_*` helpers each take their value from a CLI
+   flag when given, and otherwise ask interactively (`resolve_model`,
+   `resolve_prompt`, `resolve_runs`, `resolve_temperature`, `resolve_stream`).
+3. **Set up output** — `create_prompt_run_dir()` makes one folder per prompt,
+   named `<slug>_<hash>`, so the same prompt run against several models lands in
+   one place for easy comparison.
+4. **Run** — `generate_once()` POSTs to `/api/generate` once per run. With
+   `--stream` it reads Ollama's newline-delimited JSON chunks, prints them live,
+   and reassembles the full text; otherwise it reads a single JSON response.
+   Errors are captured (not raised) so one bad run doesn't abort the batch.
+5. **Save** — `write_model_output_file()` writes the per-model Markdown and
+   `append_metadata_run()` records the batch in the folder's `metadata.json`.
+
+A few small helpers handle the fiddly bits: `markdown_fence_block()` grows its
+code fence so a prompt that itself contains a triple-backtick block still renders
+correctly, `safe_name()` / `prompt_slug()` keep filenames filesystem-safe, and
+`saved_metadata()` trims the bulky token `context` array out of what's written to
+disk.
