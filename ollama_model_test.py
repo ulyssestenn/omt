@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import hashlib
 import io
@@ -22,9 +23,12 @@ OUTPUT_ROOT = Path("ollama-runs")
 TEMPERATURE_MIN = 0.0
 TEMPERATURE_MAX = 2.0
 TEMPERATURE_DEFAULT = 0.8
+INVALID_TEMPERATURE = object()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
     print("Ollama model tester")
     print("===================")
     print()
@@ -40,21 +44,29 @@ def main() -> int:
         print("No local Ollama models found. Install one with `ollama pull <model>`.")
         return 1
 
-    model = choose_model(models)
+    model = resolve_model(args.model, models)
+    if model is None:
+        return 1
 
-    prompt = read_multiline_prompt()
+    prompt = resolve_prompt(args.prompt_file)
+    if prompt is None:
+        return 1
     if not prompt.strip():
         print("No prompt entered. Exiting.")
         return 1
 
-    runs = ask_positive_int("How many times should this prompt be run? ")
+    runs = resolve_runs(args.runs)
+    if runs is None:
+        return 1
 
-    temperature = ask_optional_temperature()
+    temperature = resolve_temperature(args.temperature)
+    if temperature is INVALID_TEMPERATURE:
+        return 1
     options: dict[str, Any] = {}
     if temperature is not None:
         options["temperature"] = temperature
 
-    stream = ask_yes_no("Stream responses from /api/generate?", default=False)
+    stream = resolve_stream(args.stream)
 
     run_dir = create_prompt_run_dir(prompt)
     prompt_path = run_dir / "prompt.md"
@@ -101,6 +113,112 @@ def main() -> int:
     print()
     print(f"Done. Wrote {output_path}")
     return 0
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the same prompt against a local Ollama model and save the outputs."
+    )
+    parser.add_argument(
+        "--model",
+        help="Name of the local Ollama model to use. If omitted, choose interactively.",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        help="Number of generations to run. If omitted, enter this interactively.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        help=(
+            f"Generation temperature ({TEMPERATURE_MIN:.1f} to {TEMPERATURE_MAX:.1f}). "
+            "If omitted, choose interactively or press Enter for Ollama's default."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        help=(
+            "Path to a UTF-8 text file containing the prompt. "
+            "If omitted, enter the prompt interactively."
+        ),
+    )
+    stream_group = parser.add_mutually_exclusive_group()
+    stream_group.add_argument(
+        "--stream",
+        dest="stream",
+        action="store_true",
+        help="Stream responses from /api/generate.",
+    )
+    stream_group.add_argument(
+        "--no-stream",
+        dest="stream",
+        action="store_false",
+        help="Do not stream responses from /api/generate.",
+    )
+    parser.set_defaults(stream=None)
+    return parser.parse_args(argv)
+
+
+def resolve_model(requested_model: str | None, models: list[str]) -> str | None:
+    if requested_model is None:
+        return choose_model(models)
+
+    if requested_model in models:
+        return requested_model
+
+    print(f"Requested model is not installed locally: {requested_model}", file=sys.stderr)
+    print("Available local models:", file=sys.stderr)
+    for model in models:
+        print(f"  - {model}", file=sys.stderr)
+    return None
+
+
+def resolve_prompt(prompt_file: Path | None) -> str | None:
+    if prompt_file is None:
+        return read_multiline_prompt()
+
+    try:
+        return prompt_file.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        print(f"Could not read prompt file {prompt_file}: {exc}", file=sys.stderr)
+        return None
+
+
+def resolve_runs(requested_runs: int | None) -> int | None:
+    if requested_runs is None:
+        return ask_positive_int("How many times should this prompt be run? ")
+
+    if requested_runs > 0:
+        return requested_runs
+
+    print("--runs must be a positive whole number.", file=sys.stderr)
+    return None
+
+
+def resolve_temperature(requested_temperature: float | None) -> float | object | None:
+    if requested_temperature is None:
+        return ask_optional_temperature()
+
+    if (
+        math.isfinite(requested_temperature)
+        and TEMPERATURE_MIN <= requested_temperature <= TEMPERATURE_MAX
+    ):
+        return requested_temperature
+
+    print(
+        "--temperature must be a finite number in the expected range "
+        f"({TEMPERATURE_MIN:.1f} to {TEMPERATURE_MAX:.1f}).",
+        file=sys.stderr,
+    )
+    return INVALID_TEMPERATURE
+
+
+def resolve_stream(requested_stream: bool | None) -> bool:
+    if requested_stream is None:
+        return ask_yes_no("Stream responses from /api/generate?", default=False)
+    return requested_stream
 
 
 def read_multiline_prompt() -> str:
