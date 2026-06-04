@@ -323,7 +323,17 @@ def write_model_output_file(
             ]
         )
         if result["ok"]:
-            lines.extend([result["response"].rstrip(), ""])
+            raw_metadata = json.dumps(result["raw"], indent=2, sort_keys=True)
+            lines.extend(
+                [
+                    result["response"].rstrip(),
+                    "",
+                    "### Raw Ollama metadata",
+                    "",
+                    markdown_fence_block(raw_metadata, "json"),
+                    "",
+                ]
+            )
         else:
             lines.extend(["```text", result["error"], "```", ""])
 
