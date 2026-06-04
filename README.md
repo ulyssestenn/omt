@@ -1,6 +1,6 @@
 # Ollama Model Tester
 
-This small CLI asks for a prompt, lists the Ollama models installed on this machine, lets you choose a model, runs the same prompt multiple times, and saves the results.
+This small CLI asks for a prompt, lists the Ollama models installed on this machine, lets you choose a model, asks you how many times you want to run the prompt, and saves the results.
 
 ## Usage
 
