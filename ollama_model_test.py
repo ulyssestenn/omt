@@ -24,11 +24,6 @@ def main() -> int:
     print("===================")
     print()
 
-    prompt = read_multiline_prompt()
-    if not prompt.strip():
-        print("No prompt entered. Exiting.")
-        return 1
-
     try:
         models = list_ollama_models()
     except RuntimeError as exc:
@@ -41,6 +36,12 @@ def main() -> int:
         return 1
 
     model = choose_model(models)
+
+    prompt = read_multiline_prompt()
+    if not prompt.strip():
+        print("No prompt entered. Exiting.")
+        return 1
+
     runs = ask_positive_int("How many times should this prompt be run? ")
 
     temperature = ask_optional_float(
