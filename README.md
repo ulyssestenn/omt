@@ -65,7 +65,7 @@ ollama-runs/
   what-are-the-main-tradeoffs-between_835562a4/
     prompt.md         # the prompt, with its hash and timestamp
     metadata.json     # every run against this prompt (model, timing, options)
-    llama3.1-8b.md    # responses + raw Ollama metadata for this model
+    llama3.1-8b.md    # responses + Ollama metadata for this model
     gemma3-1b.md
 ```
 
@@ -73,4 +73,4 @@ The folder name is the first few words of the prompt plus a short hash of the
 full prompt. Because the folder is keyed on the prompt, **running the same
 prompt against a different model drops its output into the same folder** —
 making model-to-model comparison easy. Each model's file records every run's
-response alongside Ollama's raw metadata (token counts, timings, and so on).
+response alongside Ollama's run metadata (token counts, timings, and so on).
