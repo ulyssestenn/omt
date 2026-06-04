@@ -1,0 +1,6 @@
+# Saved run output
+ollama-runs/
+
+# Python
+__pycache__/
+*.py[cod]
