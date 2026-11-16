@@ -9,26 +9,76 @@ import hashlib
 import io
 import json
 import math
+import os
 import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, TextIO
 
 
-OLLAMA_HOST = "http://localhost:11434"
+OLLAMA_DEFAULT_HOST = "http://localhost:11434"
+OLLAMA_DEFAULT_PORT = 11434
+
+
+def resolve_ollama_host(value: str | None) -> str:
+    """Turn an ``OLLAMA_HOST`` value into a base URL, the way the Ollama CLI does.
+
+    Accepts ``host``, ``host:port``, ``:port`` and full ``scheme://host[:port]``
+    forms. Anything unparseable falls back to the local default.
+    """
+    text = (value or "").strip().strip("\"'").strip()
+    if not text:
+        return OLLAMA_DEFAULT_HOST
+
+    scheme, separator, rest = text.partition("://")
+    if separator:
+        scheme = scheme.lower()
+        default_port = {"http": 80, "https": 443}.get(scheme, OLLAMA_DEFAULT_PORT)
+    else:
+        scheme, rest, default_port = "http", text, OLLAMA_DEFAULT_PORT
+
+    try:
+        parts = urllib.parse.urlsplit(f"{scheme}://{rest}")
+        hostname = parts.hostname or "localhost"
+        port = parts.port or default_port
+    except ValueError:
+        return OLLAMA_DEFAULT_HOST
+
+    # 0.0.0.0 is what people set to make the server listen on every interface;
+    # as a destination it only works on some platforms, so talk to loopback.
+    if hostname == "0.0.0.0":
+        hostname = "127.0.0.1"
+    elif hostname == "::":
+        hostname = "::1"
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+
+    return f"{scheme}://{hostname}:{port}{parts.path.rstrip('/')}"
+
+
+OLLAMA_HOST = resolve_ollama_host(os.environ.get("OLLAMA_HOST"))
 OUTPUT_ROOT = Path("ollama-runs")
 TEMPERATURE_MIN = 0.0
 TEMPERATURE_MAX = 2.0
 TEMPERATURE_DEFAULT = 0.8
 INVALID_TEMPERATURE = object()
 
+# Spellings accepted for the on/off/default forms of Ollama's ``think`` request
+# field. Anything else is passed through as a model-defined level ("low", ...).
+THINK_ON_WORDS = frozenset({"on", "true", "yes", "y"})
+THINK_OFF_WORDS = frozenset({"off", "false", "no", "n", "none"})
+THINK_DEFAULT_WORDS = frozenset({"", "default"})
+ANSI_DIM = "\033[2m"
+ANSI_RESET = "\033[0m"
+
 # Fields dropped from the saved Ollama metadata: ``context`` is a large array of
-# token IDs only useful for resuming a conversation, and ``response`` duplicates
-# the answer already written above it as the run output.
-SAVED_METADATA_OMIT_KEYS = frozenset({"context", "response"})
+# token IDs only useful for resuming a conversation, while ``response`` and
+# ``thinking`` duplicate the text already written above it as the run output.
+SAVED_METADATA_OMIT_KEYS = frozenset({"context", "response", "thinking"})
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         models = list_ollama_models()
     except RuntimeError as exc:
-        print(f"Could not list Ollama models: {exc}", file=sys.stderr)
+        print(f"Could not list Ollama models at {OLLAMA_HOST}: {exc}", file=sys.stderr)
         print("Make sure Ollama is running, then try again.", file=sys.stderr)
         return 1
 
@@ -71,6 +121,8 @@ def main(argv: list[str] | None = None) -> int:
     if temperature is not None:
         options["temperature"] = temperature
 
+    think = resolve_think(args.think, model)
+
     stream = resolve_stream(args.stream)
 
     run_dir = create_prompt_run_dir(prompt)
@@ -89,14 +141,18 @@ def main(argv: list[str] | None = None) -> int:
     results: list[dict[str, Any]] = []
     for index in range(1, runs + 1):
         print(f"Run {index}/{runs} using {model}...")
-        result = generate_once(model, prompt, options, stream=stream)
+        result = generate_once(model, prompt, options, stream=stream, think=think)
         results.append(result)
         status = "ok" if result["ok"] else "error"
         elapsed = result["elapsed_seconds"]
         print(f"  {status} in {elapsed:.2f}s")
+        if not result["ok"]:
+            print(f"  {result['error']}", file=sys.stderr)
 
     finished_at = now_local()
-    write_model_output_file(output_path, model, prompt, results, options, stream, started_at)
+    write_model_output_file(
+        output_path, model, prompt, results, options, stream, started_at, think=think
+    )
     append_metadata_run(
         metadata_path,
         {
@@ -106,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
             "options": options,
+            "think": think,
             "stream": stream,
             "files": {
                 "model_output": output_path.name,
@@ -139,6 +196,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             f"Generation temperature ({TEMPERATURE_MIN:.1f} to {TEMPERATURE_MAX:.1f}). "
             "If omitted, choose interactively or press Enter for Ollama's default."
+        ),
+    )
+    parser.add_argument(
+        "--think",
+        metavar="VALUE",
+        help=(
+            "Thinking control for thinking-capable models: on, off, a level the model "
+            "supports (such as low, medium or high), or default to leave it to the model. "
+            "If omitted, you are asked only when the model supports thinking."
         ),
     )
     parser.add_argument(
@@ -218,6 +284,90 @@ def resolve_temperature(requested_temperature: float | None) -> float | object |
         file=sys.stderr,
     )
     return INVALID_TEMPERATURE
+
+
+def resolve_think(requested_think: str | None, model: str) -> bool | str | None:
+    """Return the ``think`` value to send, or ``None`` to leave it to the model."""
+    if requested_think is not None:
+        return parse_think_value(requested_think)
+
+    controls = model_thinking_controls(model)
+    if controls is None:
+        return None
+    return ask_optional_think(controls)
+
+
+def parse_think_value(text: str) -> bool | str | None:
+    value = text.strip()
+    lowered = value.lower()
+    if lowered in THINK_DEFAULT_WORDS:
+        return None
+    if lowered in THINK_ON_WORDS:
+        return True
+    if lowered in THINK_OFF_WORDS:
+        return False
+    return value
+
+
+def think_label(value: bool | str | None) -> str:
+    if value is None:
+        return "model default"
+    if value is True:
+        return "on"
+    if value is False:
+        return "off"
+    return str(value)
+
+
+def model_thinking_controls(model: str) -> dict[str, Any] | None:
+    """Ask Ollama what thinking controls a model has; ``None`` if it has none.
+
+    Newer Ollama versions report a ``thinking`` object from ``/api/show`` with the
+    supported values and the default. Older ones only list ``thinking`` among the
+    model's capabilities, in which case the supported values are unknown.
+    """
+    try:
+        payload = ollama_post_json("/api/show", {"model": model})
+    except RuntimeError:
+        return None
+
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict):
+        values = thinking.get("values")
+        if isinstance(values, list):
+            values = [value for value in values if isinstance(value, (bool, str))]
+            if not values or values == [False]:
+                return None
+            return {"values": values, "default": thinking.get("default")}
+
+    capabilities = payload.get("capabilities")
+    if isinstance(capabilities, list) and "thinking" in capabilities:
+        return {"values": None, "default": None}
+    return None
+
+
+def ask_optional_think(controls: dict[str, Any]) -> bool | str | None:
+    values = controls.get("values")
+    default = controls.get("default")
+    if values:
+        choices = ", ".join(think_label(value) for value in values)
+    else:
+        choices = "on, off, or a level such as low, medium, high"
+    default_note = f" ({think_label(default)})" if isinstance(default, (bool, str)) else ""
+    question = f"Thinking ({choices}), or press Enter for the model default{default_note}: "
+
+    while True:
+        answer = parse_think_value(input(question))
+        if answer is None or not values:
+            return answer
+        if isinstance(answer, bool):
+            if answer in values:
+                return answer
+        else:
+            for value in values:
+                if isinstance(value, str) and value.lower() == answer.lower():
+                    return value
+        print(f"This model supports: {choices}. Or press Enter for the model default.")
 
 
 def resolve_stream(requested_stream: bool | None) -> bool:
@@ -378,6 +528,7 @@ def generate_once(
     prompt: str,
     options: dict[str, Any],
     stream: bool = False,
+    think: bool | str | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     generated_at = now_local()
@@ -389,6 +540,8 @@ def generate_once(
     }
     if options:
         request_payload["options"] = options
+    if think is not None:
+        request_payload["think"] = think
 
     try:
         if stream:
@@ -401,7 +554,8 @@ def generate_once(
             "ok": True,
             "generated_at": generated_at.isoformat(),
             "elapsed_seconds": elapsed,
-            "response": response_payload.get("response", ""),
+            "response": response_payload.get("response") or "",
+            "thinking": response_payload.get("thinking") or "",
             "raw": response_payload,
         }
     except RuntimeError as exc:
@@ -448,7 +602,10 @@ def ollama_post_stream_json(
     if response_output is None:
         response_output = sys.stdout
 
+    dim, reset = (ANSI_DIM, ANSI_RESET) if is_terminal(response_output) else ("", "")
     response_buffer = io.StringIO()
+    thinking_buffer = io.StringIO()
+    showing_thinking = False
     final_chunk: dict[str, Any] | None = None
     saw_chunk = False
     try:
@@ -468,8 +625,22 @@ def ollama_post_stream_json(
                     raise RuntimeError(f"streaming JSON line {line_number} was not an object")
 
                 saw_chunk = True
+                # Thinking models send their reasoning in ``thinking`` chunks
+                # ahead of the ``response`` chunks that carry the answer.
+                thinking_text = chunk.get("thinking")
+                if isinstance(thinking_text, str) and thinking_text:
+                    if not showing_thinking:
+                        response_output.write(f"{dim}Thinking:{reset}\n")
+                        showing_thinking = True
+                    thinking_buffer.write(thinking_text)
+                    response_output.write(f"{dim}{thinking_text}{reset}")
+                    response_output.flush()
+
                 response_text = chunk.get("response")
                 if isinstance(response_text, str) and response_text:
+                    if showing_thinking:
+                        response_output.write(f"\n\n{dim}Response:{reset}\n")
+                        showing_thinking = False
                     response_buffer.write(response_text)
                     response_output.write(response_text)
                     response_output.flush()
@@ -490,7 +661,16 @@ def ollama_post_stream_json(
 
     stream_payload = dict(final_chunk)
     stream_payload["response"] = response_buffer.getvalue()
+    if thinking_buffer.tell():
+        stream_payload["thinking"] = thinking_buffer.getvalue()
     return stream_payload
+
+
+def is_terminal(stream: TextIO) -> bool:
+    try:
+        return stream.isatty()
+    except (AttributeError, ValueError):
+        return False
 
 
 def open_json_request(request: urllib.request.Request) -> dict[str, Any]:
@@ -536,6 +716,7 @@ def write_model_output_file(
     options: dict[str, Any],
     stream: bool,
     started_at: dt.datetime,
+    think: bool | str | None = None,
 ) -> None:
     lines = [
         "# Ollama Model Test",
@@ -545,6 +726,7 @@ def write_model_output_file(
         f"Prompt hash: `{prompt_hash(prompt)}`",
         f"Runs: {len(results)}",
         f"Options: `{json.dumps(options, sort_keys=True)}`",
+        f"Thinking: `{think_label(think)}`",
         f"Streaming: `{stream}`",
         "",
         "## Prompt",
@@ -566,6 +748,9 @@ def write_model_output_file(
         )
         if result["ok"]:
             metadata_json = json.dumps(saved_metadata(result["raw"]), indent=2, sort_keys=True)
+            thinking = result.get("thinking", "").strip()
+            if thinking:
+                lines.extend(["### Thinking", "", thinking, "", "### Response", ""])
             lines.extend(
                 [
                     result["response"].rstrip(),
