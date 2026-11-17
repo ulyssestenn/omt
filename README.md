@@ -42,6 +42,11 @@ You'll be asked, in order:
 It then runs the prompt the requested number of times on each model and writes
 the results under `ollama-runs/`.
 
+Each model is unloaded from Ollama after its runs, before testing the next model.
+It stays loaded between repeated runs under Ollama's normal keep-alive setting.
+Unloading is also attempted if testing fails or is interrupted; if Ollama cannot
+unload the model, the tool prints a warning and keeps the saved results.
+
 Results are saved after every run, so pressing Ctrl-C (or a crash) partway
 through keeps everything that had finished. Only the run in progress is lost.
 

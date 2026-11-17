@@ -281,106 +281,109 @@ def run(args: argparse.Namespace) -> int:
         warned_about_length = False
 
         print()
-        for index in range(1, runs + 1):
-            print(f"Run {index}/{runs} using {model}...")
-            try:
-                result = generate_once(
+        try:
+            for index in range(1, runs + 1):
+                print(f"Run {index}/{runs} using {model}...")
+                try:
+                    result = generate_once(
+                        model,
+                        full_prompt,
+                        options,
+                        stream=stream,
+                        think=think,
+                        images=encoded_images,
+                        system=system,
+                        timeout=timeout,
+                    )
+                except KeyboardInterrupt:
+                    interrupted = True
+                    print()
+                    break
+                results.append(result)
+                status = "ok" if result["ok"] else "error"
+                elapsed = result["elapsed_seconds"]
+                print(f"  {status} in {elapsed:.2f}s")
+                if not result["ok"]:
+                    print(f"  {result['error']}", file=sys.stderr)
+                if context_length is None:
+                    context_length = loaded_context_length(model, options)
+
+                input_did_not_fit = is_context_error(result)
+                if input_did_not_fit:
+                    size = f" ({context_length:,} tokens)" if context_length else ""
+                    print(
+                        f"  The prompt and its files do not fit in {model}'s context window{size}. "
+                        "Nothing was cut: the run was stopped so that you don't get an answer "
+                        "based on only part of the input. Give the model more room with "
+                        "--option num_ctx=<a larger number>, or send less."
+                    )
+                elif not warned_about_context and prompt_filled_context(result, context_length):
+                    warned_about_context = True
+                    print(
+                        f"  Note: the prompt filled {model}'s whole context window "
+                        f"({context_length:,} tokens), so the model probably did not see all "
+                        "of it. Give it more room with --option num_ctx=<a larger number>."
+                    )
+                if not warned_about_length and stopped_at_length(result):
+                    warned_about_length = True
+                    print(
+                        "  Note: this answer stopped at a length limit, so it is probably "
+                        "incomplete. Either the context window filled up (raise it with "
+                        "--option num_ctx=<a larger number>) or num_predict was reached."
+                    )
+
+                # Save after every run so an interruption or crash later on loses
+                # nothing that has already been generated.
+                write_model_output_file(
+                    output_path,
                     model,
-                    full_prompt,
+                    prompt,
+                    results,
                     options,
-                    stream=stream,
+                    stream,
+                    started_at,
                     think=think,
-                    images=encoded_images,
+                    runs_requested=runs,
+                    digest=digest,
+                    images=images,
+                    text_files=text_files,
+                    context_length=context_length,
                     system=system,
-                    timeout=timeout,
+                    model_system=model_system,
                 )
-            except KeyboardInterrupt:
-                interrupted = True
-                print()
-                break
-            results.append(result)
-            status = "ok" if result["ok"] else "error"
-            elapsed = result["elapsed_seconds"]
-            print(f"  {status} in {elapsed:.2f}s")
-            if not result["ok"]:
-                print(f"  {result['error']}", file=sys.stderr)
-            if context_length is None:
-                context_length = loaded_context_length(model, options)
-
-            input_did_not_fit = is_context_error(result)
-            if input_did_not_fit:
-                size = f" ({context_length:,} tokens)" if context_length else ""
-                print(
-                    f"  The prompt and its files do not fit in {model}'s context window{size}. "
-                    "Nothing was cut: the run was stopped so that you don't get an answer "
-                    "based on only part of the input. Give the model more room with "
-                    "--option num_ctx=<a larger number>, or send less."
-                )
-            elif not warned_about_context and prompt_filled_context(result, context_length):
-                warned_about_context = True
-                print(
-                    f"  Note: the prompt filled {model}'s whole context window "
-                    f"({context_length:,} tokens), so the model probably did not see all "
-                    "of it. Give it more room with --option num_ctx=<a larger number>."
-                )
-            if not warned_about_length and stopped_at_length(result):
-                warned_about_length = True
-                print(
-                    "  Note: this answer stopped at a length limit, so it is probably "
-                    "incomplete. Either the context window filled up (raise it with "
-                    "--option num_ctx=<a larger number>) or num_predict was reached."
-                )
-
-            # Save after every run so an interruption or crash later on loses
-            # nothing that has already been generated.
-            write_model_output_file(
-                output_path,
-                model,
-                prompt,
-                results,
-                options,
-                stream,
-                started_at,
-                think=think,
-                runs_requested=runs,
-                digest=digest,
-                images=images,
-                text_files=text_files,
-                context_length=context_length,
-                system=system,
-                model_system=model_system,
-            )
-            metadata = save_metadata_run(
-                metadata_path,
-                {
-                    "model": model,
-                    "digest": digest,
-                    "runs_requested": runs,
-                    "runs_completed": len(results),
-                    "started_at": started_at.isoformat(),
-                    "finished_at": now_local().isoformat(),
-                    "options": options,
-                    "think": think,
-                    "system": system or None,
-                    "model_system": model_system,
-                    "stream": stream,
-                    "context_length": context_length,
-                    "results": [run_stats(item) for item in results],
-                    "files": {
-                        "model_output": output_path.name,
+                metadata = save_metadata_run(
+                    metadata_path,
+                    {
+                        "model": model,
+                        "digest": digest,
+                        "runs_requested": runs,
+                        "runs_completed": len(results),
+                        "started_at": started_at.isoformat(),
+                        "finished_at": now_local().isoformat(),
+                        "options": options,
+                        "think": think,
+                        "system": system or None,
+                        "model_system": model_system,
+                        "stream": stream,
+                        "context_length": context_length,
+                        "results": [run_stats(item) for item in results],
+                        "files": {
+                            "model_output": output_path.name,
+                        },
                     },
-                },
-                prompt,
-                prompt_path.name,
-                images,
-                text_files,
-            )
-            write_summary_file(run_dir / SUMMARY_FILE_NAME, metadata)
+                    prompt,
+                    prompt_path.name,
+                    images,
+                    text_files,
+                )
+                write_summary_file(run_dir / SUMMARY_FILE_NAME, metadata)
 
-            if input_did_not_fit:
-                if index < runs:
-                    print("  Skipping this model's remaining runs: they would fail the same way.")
-                break
+                if input_did_not_fit:
+                    if index < runs:
+                        print("  Skipping this model's remaining runs: they would fail the same way.")
+                    break
+        finally:
+            unload_model(model)
 
         if results:
             finished = len(results) == runs
@@ -1393,6 +1396,20 @@ def generate_once(
             "elapsed_seconds": elapsed,
             "error": str(exc),
         }
+
+
+def unload_model(model: str) -> None:
+    """Release this model after its runs without losing results if cleanup fails."""
+    try:
+        response = ollama_post_json(
+            "/api/generate",
+            {"model": model, "keep_alive": 0, "stream": False},
+            timeout=QUICK_TIMEOUT_SECONDS,
+        )
+        if response.get("error"):
+            raise RuntimeError(str(response["error"]))
+    except RuntimeError as exc:
+        print(f"Warning: could not unload {model}: {exc}", file=sys.stderr)
 
 
 def ollama_get_json(path: str) -> dict[str, Any]:
