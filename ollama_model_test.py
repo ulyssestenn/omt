@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import difflib
 import hashlib
 import io
 import json
@@ -81,6 +82,48 @@ ANSI_RESET = "\033[0m"
 # ``thinking`` duplicate the text already written above it as the run output.
 SAVED_METADATA_OMIT_KEYS = frozenset({"context", "response", "thinking"})
 
+# Generation options Ollama accepts in a request's ``options``, and the type of
+# value each takes. Ollama silently ignores names it doesn't know, so --option
+# is checked against this list to catch typos. ``temperature`` is left out
+# because it has its own flag and question.
+OLLAMA_OPTION_TYPES = {
+    "num_ctx": int,
+    "seed": int,
+    "num_predict": int,
+    "top_k": int,
+    "top_p": float,
+    "min_p": float,
+    "typical_p": float,
+    "repeat_last_n": int,
+    "repeat_penalty": float,
+    "presence_penalty": float,
+    "frequency_penalty": float,
+    "stop": str,
+    "num_keep": int,
+    "num_batch": int,
+    "num_gpu": int,
+    "main_gpu": int,
+    "num_thread": int,
+    "draft_num_predict": int,
+    "use_mmap": bool,
+}
+OPTION_TRUE_WORDS = frozenset({"true", "yes", "on", "1"})
+OPTION_FALSE_WORDS = frozenset({"false", "no", "off", "0"})
+
+# Figures copied from Ollama's response into metadata.json for each run, which
+# is what the summary table is built from.
+RUN_STAT_KEYS = (
+    "eval_count",
+    "eval_duration",
+    "prompt_eval_count",
+    "prompt_eval_duration",
+    "load_duration",
+    "total_duration",
+    "done_reason",
+)
+SUMMARY_FILE_NAME = "summary.md"
+MISSING = "–"
+
 # ``--model all`` (or answering "all" interactively) selects every local model.
 ALL_MODELS = "all"
 
@@ -101,6 +144,10 @@ def main(argv: list[str] | None = None) -> int:
     print("Ollama model tester")
     print("===================")
     print()
+
+    extra_options = parse_options(args.option or [])
+    if extra_options is None:
+        return 1
 
     try:
         installed = list_ollama_models()
@@ -145,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     temperature = resolve_temperature(args.temperature)
     if temperature is INVALID_TEMPERATURE:
         return 1
-    options: dict[str, Any] = {}
+    options: dict[str, Any] = dict(extra_options)
     if temperature is not None:
         options["temperature"] = temperature
 
@@ -172,6 +219,8 @@ def main(argv: list[str] | None = None) -> int:
         output_path = unique_model_output_path(run_dir, model)
         started_at = now_local()
         results: list[dict[str, Any]] = []
+        context_length: int | None = None
+        warned_about_context = False
 
         print()
         for index in range(1, runs + 1):
@@ -190,6 +239,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {status} in {elapsed:.2f}s")
             if not result["ok"]:
                 print(f"  {result['error']}", file=sys.stderr)
+            elif context_length is None:
+                context_length = loaded_context_length(model, options)
+            if not warned_about_context and prompt_filled_context(result, context_length):
+                warned_about_context = True
+                print(
+                    f"  Note: the prompt filled {model}'s whole context window "
+                    f"({context_length:,} tokens), so the model probably did not see all "
+                    "of it. Give it more room with --option num_ctx=<a larger number>."
+                )
 
             # Save after every run so an interruption or crash later on loses
             # nothing that has already been generated.
@@ -206,8 +264,9 @@ def main(argv: list[str] | None = None) -> int:
                 digest=digest,
                 images=images,
                 text_files=text_files,
+                context_length=context_length,
             )
-            save_metadata_run(
+            metadata = save_metadata_run(
                 metadata_path,
                 {
                     "model": model,
@@ -219,6 +278,8 @@ def main(argv: list[str] | None = None) -> int:
                     "options": options,
                     "think": think,
                     "stream": stream,
+                    "context_length": context_length,
+                    "results": [run_stats(item) for item in results],
                     "files": {
                         "model_output": output_path.name,
                     },
@@ -228,6 +289,7 @@ def main(argv: list[str] | None = None) -> int:
                 images,
                 text_files,
             )
+            write_summary_file(run_dir / SUMMARY_FILE_NAME, metadata)
 
         if results:
             print(f"Wrote {output_path}")
@@ -241,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return EXIT_INTERRUPTED
-    print("Done.")
+    print(f"Done. Comparison table: {run_dir / SUMMARY_FILE_NAME}")
     return 0
 
 
@@ -294,6 +356,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--option",
+        action="append",
+        metavar="NAME=VALUE",
+        help=(
+            "Advanced, and never required: set one of Ollama's generation options, such as "
+            "num_ctx=8192 (context window size) or seed=42 (repeatable output). Repeat the "
+            "flag for several. Left out, each model's own defaults apply. "
+            "The README explains the ones worth knowing."
+        ),
+    )
+    parser.add_argument(
         "--prompt-file",
         type=Path,
         help=(
@@ -316,6 +389,226 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(stream=None)
     return parser.parse_args(argv)
+
+
+def parse_options(pairs: list[str]) -> dict[str, Any] | None:
+    """Turn ``--option NAME=VALUE`` arguments into Ollama options; ``None`` if invalid."""
+    options: dict[str, Any] = {}
+    for pair in pairs:
+        try:
+            name, value = parse_option(pair)
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return None
+        if name == "stop":
+            options.setdefault("stop", []).append(value)
+        else:
+            options[name] = value
+    return options
+
+
+def parse_option(pair: str) -> tuple[str, Any]:
+    name, separator, text = pair.partition("=")
+    name = name.strip().lower().replace("-", "_")
+    text = text.strip()
+    if not separator or not name or not text:
+        raise ValueError(
+            f"--option {pair!r}: options are written NAME=VALUE, for example num_ctx=8192."
+        )
+    if name == "temperature":
+        raise ValueError("Set the temperature with --temperature, not --option.")
+
+    value_type = OLLAMA_OPTION_TYPES.get(name)
+    if value_type is None:
+        close = difflib.get_close_matches(name, OLLAMA_OPTION_TYPES, n=1)
+        hint = f" Did you mean {close[0]}?" if close else ""
+        known = ", ".join(OLLAMA_OPTION_TYPES)
+        raise ValueError(f"--option {name}: not an option Ollama knows.{hint}\nKnown options: {known}")
+
+    if value_type is str:
+        return name, text
+    if value_type is bool:
+        if text.lower() in OPTION_TRUE_WORDS:
+            return name, True
+        if text.lower() in OPTION_FALSE_WORDS:
+            return name, False
+        raise ValueError(f"--option {name}: needs true or false, not {text!r}.")
+    try:
+        number = value_type(text)
+    except ValueError:
+        number = None
+    if number is None or not math.isfinite(number):
+        kind = "a whole number" if value_type is int else "a number"
+        raise ValueError(f"--option {name}: needs {kind}, not {text!r}.")
+    return name, number
+
+
+def loaded_context_length(model: str, options: dict[str, Any]) -> int | None:
+    """Return the context window, in tokens, that a model is running with.
+
+    Ollama reports it for loaded models, so this is asked after a run. Failing
+    that, an explicit ``num_ctx`` option is the best available answer.
+    """
+    try:
+        loaded = ollama_get_json("/api/ps").get("models", [])
+    except RuntimeError:
+        loaded = []
+    for item in loaded if isinstance(loaded, list) else []:
+        if isinstance(item, dict) and model in (item.get("name"), item.get("model")):
+            if is_positive_int(item.get("context_length")):
+                return item["context_length"]
+
+    num_ctx = options.get("num_ctx")
+    return num_ctx if is_positive_int(num_ctx) else None
+
+
+def is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def prompt_filled_context(result: dict[str, Any], context_length: int | None) -> bool:
+    """Whether the prompt alone took up the whole context window, so was cut."""
+    if not result.get("ok") or context_length is None:
+        return False
+    prompt_tokens = result["raw"].get("prompt_eval_count")
+    return is_positive_int(prompt_tokens) and prompt_tokens >= context_length
+
+
+def run_stats(result: dict[str, Any]) -> dict[str, Any]:
+    """The figures worth keeping from one run, for metadata.json and the summary."""
+    stats: dict[str, Any] = {
+        "ok": result["ok"],
+        "elapsed_seconds": round(result["elapsed_seconds"], 3),
+    }
+    if result["ok"]:
+        raw = result["raw"]
+        stats.update({key: raw[key] for key in RUN_STAT_KEYS if key in raw})
+    else:
+        stats["error"] = result["error"]
+    return stats
+
+
+def write_summary_file(path: Path, metadata: dict[str, Any]) -> None:
+    """Write one table row per model file in the folder, for comparing them."""
+    headers = [
+        "Output",
+        "Model",
+        "Thinking",
+        "Options",
+        "Runs",
+        "Output tokens",
+        "Tokens/s",
+        "Time (s)",
+        "Load (s)",
+        "Prompt tokens",
+        "Context",
+        "Digest",
+        "Started",
+    ]
+    rows: list[list[str]] = []
+    notes: list[str] = []
+    for entry in metadata.get("runs", []):
+        if isinstance(entry, dict):
+            row, note = summary_row(entry)
+            rows.append(row)
+            if note:
+                notes.append(note)
+
+    lines = [
+        "# Summary",
+        "",
+        f"Prompt: {metadata.get('prompt_preview', '')}",
+        f"Prompt hash: `{metadata.get('prompt_hash', '')}`",
+        "",
+        "| " + " | ".join(headers) + " |",
+        "|" + " --- |" * len(headers),
+    ]
+    lines.extend("| " + " | ".join(cell.replace("|", "\\|") for cell in row) + " |" for row in rows)
+    lines.extend(
+        [
+            "",
+            "Output tokens, tokens/s and time are averages over the runs that succeeded, and",
+            "count thinking as well as the answer. Load is the longest model load time, which",
+            "is usually the first run. Prompt tokens against Context shows how full the",
+            f"model's context window was. {MISSING} means the figure was not recorded.",
+            "",
+        ]
+    )
+    for note in notes:
+        lines.extend([note, ""])
+    write_text_atomic(path, "\n".join(lines))
+
+
+def summary_row(entry: dict[str, Any]) -> tuple[list[str], str]:
+    """Return the table cells for one metadata entry, plus a warning if it needs one."""
+    files = entry.get("files") if isinstance(entry.get("files"), dict) else {}
+    output_name = files.get("model_output") or ""
+    results = entry.get("results") if isinstance(entry.get("results"), list) else []
+    succeeded = [item for item in results if isinstance(item, dict) and item.get("ok")]
+
+    def values(key: str) -> list[float]:
+        found = [item.get(key) for item in succeeded]
+        return [v for v in found if isinstance(v, (int, float)) and not isinstance(v, bool)]
+
+    def average(key: str, digits: int = 0) -> str:
+        found = values(key)
+        return f"{sum(found) / len(found):,.{digits}f}" if found else MISSING
+
+    timed = [
+        item
+        for item in succeeded
+        if is_positive_int(item.get("eval_count")) and is_positive_int(item.get("eval_duration"))
+    ]
+    if timed:
+        tokens = sum(item["eval_count"] for item in timed)
+        seconds = sum(item["eval_duration"] for item in timed) / 1e9
+        tokens_per_second = f"{tokens / seconds:,.1f}"
+    else:
+        tokens_per_second = MISSING
+
+    completed = entry.get("runs_completed")
+    requested = entry.get("runs_requested")
+    runs = str(completed) if completed is not None else MISSING
+    if is_positive_int(requested) and isinstance(completed, int) and completed < requested:
+        runs = f"{completed} of {requested}"
+    failed = len(results) - len(succeeded)
+    if failed:
+        runs += f" ({failed} failed)"
+
+    options = entry.get("options") if isinstance(entry.get("options"), dict) else {}
+    option_text = ", ".join(f"{key}={json.dumps(options[key])}" for key in sorted(options))
+
+    loads = values("load_duration")
+    prompt_tokens = values("prompt_eval_count")
+    context_length = entry.get("context_length")
+    digest = str(entry.get("digest") or "")
+    digest = digest[len("sha256:") :] if digest.startswith("sha256:") else digest
+    started = str(entry.get("started_at") or "")[:16].replace("T", " ")
+
+    row = [
+        f"[{output_name}]({output_name})" if output_name else MISSING,
+        str(entry.get("model") or MISSING),
+        think_label(entry["think"]) if "think" in entry else MISSING,
+        option_text or "defaults",
+        runs,
+        average("eval_count"),
+        tokens_per_second,
+        average("elapsed_seconds", 1),
+        f"{max(loads) / 1e9:,.1f}" if loads else MISSING,
+        f"{max(prompt_tokens):,.0f}" if prompt_tokens else MISSING,
+        f"{context_length:,}" if is_positive_int(context_length) else MISSING,
+        f"`{digest[:12]}`" if digest else MISSING,
+        started or MISSING,
+    ]
+
+    note = ""
+    if prompt_tokens and is_positive_int(context_length) and max(prompt_tokens) >= context_length:
+        note = (
+            f"**Input probably cut short in `{output_name}`:** the prompt filled the whole "
+            f"context window ({context_length:,} tokens). Give the model more room with "
+            "`--option num_ctx=<a larger number>`."
+        )
+    return row, note
 
 
 def resolve_models(requested_models: list[str] | None, installed: list[str]) -> list[str] | None:
@@ -1061,6 +1354,7 @@ def write_model_output_file(
     digest: str = "",
     images: list[dict[str, Any]] | None = None,
     text_files: list[dict[str, Any]] | None = None,
+    context_length: int | None = None,
 ) -> None:
     runs = str(len(results))
     if runs_requested is not None and len(results) < runs_requested:
@@ -1079,6 +1373,8 @@ def write_model_output_file(
             f"Streaming: `{stream}`",
         ]
     )
+    if context_length:
+        lines.append(f"Context window: {context_length:,} tokens")
     if text_files:
         names = ", ".join(f"`{item['original_name']}`" for item in text_files)
         lines.append(f"Text files: {names} (sent ahead of the prompt; full text in `prompt.md`)")
@@ -1145,7 +1441,7 @@ def save_metadata_run(
     prompt_file_name: str,
     images: list[dict[str, Any]] | None = None,
     text_files: list[dict[str, Any]] | None = None,
-) -> None:
+) -> dict[str, Any]:
     """Add a run entry to ``metadata.json``, or update it if it is already there.
 
     Entries are matched on their model output file, which is unique per model per
@@ -1178,6 +1474,7 @@ def save_metadata_run(
         "prompt_preview": prompt_preview(prompt),
         "files": {
             "prompt": prompt_file_name,
+            "summary": SUMMARY_FILE_NAME,
         },
         "runs": runs,
     }
@@ -1187,6 +1484,7 @@ def save_metadata_run(
         metadata["text_files"] = text_file_records(text_files)
 
     write_text_atomic(path, json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    return metadata
 
 
 def legacy_metadata_as_run(metadata: dict[str, Any]) -> dict[str, Any] | None:

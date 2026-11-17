@@ -1,9 +1,9 @@
 # Ollama Model Tester
 
 A small, dependency-free CLI for running the same prompt — optionally with
-images, text or code files — against your local [Ollama](https://ollama.com) models and saving every
-response to disk, so you can compare models (or compare repeated runs of one
-model) side by side.
+images, text or code files — against your local [Ollama](https://ollama.com)
+models and saving every response to disk, so you can compare models (or compare
+repeated runs of one model) side by side.
 
 It uses only the Python standard library: no `pip install` required.
 
@@ -58,6 +58,7 @@ Anything you omit is still asked interactively.
 | `--temperature T` | Temperature, `0.0`–`2.0` |
 | `--think VALUE` | Thinking control: `on`, `off`, a level the model supports (e.g. `low`, `medium`, `high`), or `default` to leave it to the model |
 | `--prompt-file PATH` | Read the prompt from a UTF-8 text file. No files question is asked; use `--file` |
+| `--option NAME=VALUE` | Advanced and never required: set one of Ollama's generation options. See [Advanced options](#advanced-options) |
 | `--stream` / `--no-stream` | Stream responses live, or don't |
 
 Example — run a saved prompt three times, fully non-interactive:
@@ -111,6 +112,34 @@ it, Ollama silently drops the beginning of the input. Your prompt goes last so
 that it survives; compare `prompt_eval_count` in a run's metadata against the
 size of what you sent if the answers look like the model missed something.
 
+## Advanced options
+
+You never have to set any of these. They are not part of the questions, and
+without them every model runs with its own defaults, which is the right choice
+unless you have a specific reason to change something.
+
+When you do, pass `--option NAME=VALUE`, once per option:
+
+```bash
+python3 ollama_model_test.py --option num_ctx=16384 --option seed=42
+```
+
+The ones most likely to be useful:
+
+| Option | What it does | When to reach for it |
+| --- | --- | --- |
+| `num_ctx` | Size of the model's context window, in tokens: how much prompt plus answer it can hold at once | The tool tells you the prompt filled the context window, which happens with large files. Try `8192` or `16384`; bigger uses more memory |
+| `seed` | Fixes the randomness, so the same prompt and settings give the same answer | You want repeatable results, or a fair like-for-like rerun |
+| `num_predict` | Maximum number of tokens in the answer | A model rambles or never stops, or you want short answers |
+| `top_p`, `top_k` | Narrow or widen the range of words the model picks from | Fine-tuning variety beyond what temperature does |
+| `repeat_penalty` | Discourages repeating the same phrases | A model gets stuck in loops |
+| `stop` | Text that ends the answer when the model produces it. Can be given more than once | You want output cut at a marker |
+
+The name is checked before anything runs, so a typo such as `num_ctxt` is
+reported with a suggestion instead of being silently ignored. Temperature keeps
+its own flag, `--temperature`. Whatever you set is recorded with the run and
+shown in the comparison table.
+
 ## Using another host
 
 The tool reads the same `OLLAMA_HOST` environment variable as the `ollama`
@@ -128,6 +157,7 @@ Results are grouped into one folder per prompt:
 ollama-runs/
   what-are-the-main-tradeoffs-between_835562a4/
     prompt.md         # the prompt, with its hash and timestamp
+    summary.md        # comparison table: one row per model file
     metadata.json     # every run against this prompt (model, timing, options)
     llama3.1-8b.md    # responses + Ollama metadata for this model
     gemma3-1b.md
@@ -139,6 +169,14 @@ full prompt. Because the folder is keyed on the prompt, **running the same
 prompt against a different model drops its output into the same folder** —
 making model-to-model comparison easy. Each model's file records every run's
 response alongside Ollama's run metadata (token counts, timings, and so on).
+
+`summary.md` is rewritten after every run. It has one row for each model file
+in the folder, including ones from earlier sessions, with the settings used,
+output tokens, tokens per second, time, model load time, and how much of the
+context window the prompt took. If a prompt filled the whole window, the
+summary and the terminal both say so, since the model then probably did not
+see all of the input. Rows for results saved by older versions of the tool show
+`–` where the figures were not recorded.
 
 Added files count as part of the prompt: the hash covers them too, so the same
 question about a different picture or document gets its own folder. Images are
