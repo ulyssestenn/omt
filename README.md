@@ -47,8 +47,13 @@ through keeps everything that had finished. Only the run in progress is lost.
 
 ## Command-line flags (optional)
 
-Every prompt above can be supplied up front, which makes the tool scriptable.
-Anything you omit is still asked interactively.
+Every question above can be answered up front, which makes the tool scriptable.
+Whichever of those you omit is still asked interactively. `--option`, `--system`,
+`--system-file` and `--timeout` are extras: they are never asked for, and you
+can ignore them entirely.
+
+If a question comes up when there is no way to answer it, such as a scheduled
+run that left out `--runs`, the tool stops and names the flag to add.
 
 | Flag | Description |
 | --- | --- |
@@ -58,7 +63,9 @@ Anything you omit is still asked interactively.
 | `--temperature T` | Temperature, `0.0`–`2.0` |
 | `--think VALUE` | Thinking control: `on`, `off`, a level the model supports (e.g. `low`, `medium`, `high`), or `default` to leave it to the model |
 | `--prompt-file PATH` | Read the prompt from a UTF-8 text file. No files question is asked; use `--file` |
+| `--system TEXT` / `--system-file PATH` | Optional system prompt, given directly or read from a UTF-8 text file. See [System prompt](#system-prompt) |
 | `--option NAME=VALUE` | Advanced and never required: set one of Ollama's generation options. See [Advanced options](#advanced-options) |
+| `--timeout SECONDS` | Give up on a run when Ollama sends nothing for this long. See [Waiting and timeouts](#waiting-and-timeouts) |
 | `--stream` / `--no-stream` | Stream responses live, or don't |
 
 Example — run a saved prompt three times, fully non-interactive:
@@ -112,6 +119,22 @@ it, Ollama silently drops the beginning of the input. Your prompt goes last so
 that it survives; compare `prompt_eval_count` in a run's metadata against the
 size of what you sent if the answers look like the model missed something.
 
+## System prompt
+
+A system prompt is a standing instruction given to the model apart from your
+question, such as "You are a terse code reviewer" or "Answer only in French".
+Many models come with one built in. `--system` or `--system-file` replaces it
+for the run; leave them out and each model uses its own.
+
+```bash
+python3 ollama_model_test.py --model all --system "Answer in one sentence."
+```
+
+The system prompt is treated as a setting, like temperature. It does not change
+which folder the results go in, so the same question asked under different
+system prompts lands in one folder and shows up as separate rows in the
+comparison table.
+
 ## Advanced options
 
 You never have to set any of these. They are not part of the questions, and
@@ -139,6 +162,22 @@ The name is checked before anything runs, so a typo such as `num_ctxt` is
 reported with a suggestion instead of being silently ignored. Temperature keeps
 its own flag, `--temperature`. Whatever you set is recorded with the run and
 shown in the comparison table.
+
+## Waiting and timeouts
+
+A run has no time limit by default. Large models, long thinking and big files
+can legitimately take a long time, and a run that is still working is worth
+more than one cut off. Ctrl-C stops the tool at any point and keeps every run
+that had finished.
+
+For unattended use, `--timeout SECONDS` gives up on a run when Ollama has sent
+nothing for that long, records it as an error, and moves on to the next one.
+With streaming on, text arrives as it is produced, so the limit only applies to
+silences: mainly loading the model and reading the prompt. With streaming off,
+nothing arrives until the whole answer is done, so it limits the entire run.
+
+Listing models and looking up their details should take moments, so those
+calls give up after 30 seconds, and an unreachable Ollama is reported promptly.
 
 ## Using another host
 
@@ -171,8 +210,8 @@ making model-to-model comparison easy. Each model's file records every run's
 response alongside Ollama's run metadata (token counts, timings, and so on).
 
 `summary.md` is rewritten after every run. It has one row for each model file
-in the folder, including ones from earlier sessions, with the settings used,
-output tokens, tokens per second, time, model load time, and how much of the
+in the folder, including ones from earlier sessions, with the settings used
+(thinking, system prompt, options), output tokens, tokens per second, time, model load time, and how much of the
 context window the prompt took. If a prompt filled the whole window, the
 summary and the terminal both say so, since the model then probably did not
 see all of the input. Rows for results saved by older versions of the tool show

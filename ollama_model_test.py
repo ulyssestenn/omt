@@ -8,11 +8,13 @@ import base64
 import datetime as dt
 import difflib
 import hashlib
+import http.client
 import io
 import json
 import math
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -120,6 +122,11 @@ RUN_STAT_KEYS = (
     "total_duration",
     "done_reason",
 )
+# Listing models and looking up their details should take moments, so those
+# calls give up quickly. Generation has no time limit unless --timeout sets one:
+# a slow run that is still working is worth more than one cut off.
+QUICK_TIMEOUT_SECONDS = 30.0
+SUMMARY_SYSTEM_PREVIEW_CHARS = 40
 SUMMARY_FILE_NAME = "summary.md"
 MISSING = "–"
 
@@ -137,15 +144,48 @@ IMAGE_SIGNATURES = (
 EXIT_INTERRUPTED = 130
 
 
+class InputEnded(Exception):
+    """A question could not be asked because there is no more input to read."""
+
+    def __init__(self, flag: str) -> None:
+        super().__init__(flag)
+        self.flag = flag
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        return run(args)
+    except InputEnded as exc:
+        print()
+        print(
+            "Input ended before that question was answered. "
+            f"Pass {exc.flag} to answer it up front.",
+            file=sys.stderr,
+        )
+        return 1
+    except KeyboardInterrupt:
+        print()
+        print("Cancelled.", file=sys.stderr)
+        return EXIT_INTERRUPTED
 
+
+def run(args: argparse.Namespace) -> int:
     print("Ollama model tester")
     print("===================")
     print()
 
     extra_options = parse_options(args.option or [])
     if extra_options is None:
+        return 1
+
+    system = resolve_system(args.system, args.system_file)
+    if system is None:
+        return 1
+
+    timeout = args.timeout
+    if timeout is not None and not (math.isfinite(timeout) and timeout > 0):
+        print("--timeout must be a number of seconds greater than zero.", file=sys.stderr)
         return 1
 
     try:
@@ -226,7 +266,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Run {index}/{runs} using {model}...")
             try:
                 result = generate_once(
-                    model, full_prompt, options, stream=stream, think=think, images=encoded_images
+                    model,
+                    full_prompt,
+                    options,
+                    stream=stream,
+                    think=think,
+                    images=encoded_images,
+                    system=system,
+                    timeout=timeout,
                 )
             except KeyboardInterrupt:
                 interrupted = True
@@ -264,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
                 images=images,
                 text_files=text_files,
                 context_length=context_length,
+                system=system,
             )
             metadata = save_metadata_run(
                 metadata_path,
@@ -276,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
                     "finished_at": now_local().isoformat(),
                     "options": options,
                     "think": think,
+                    "system": system or None,
                     "stream": stream,
                     "context_length": context_length,
                     "results": [run_stats(item) for item in results],
@@ -371,6 +420,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Path to a UTF-8 text file containing the prompt. "
             "If omitted, enter the prompt interactively."
+        ),
+    )
+    system_group = parser.add_mutually_exclusive_group()
+    system_group.add_argument(
+        "--system",
+        metavar="TEXT",
+        help=(
+            "Optional system prompt: a standing instruction that replaces the model's "
+            "built-in one. Never asked for; left out, the model's own is used."
+        ),
+    )
+    system_group.add_argument(
+        "--system-file",
+        type=Path,
+        metavar="PATH",
+        help="Read the system prompt from a UTF-8 text file.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "Give up on a run when Ollama sends nothing for this many seconds. Without "
+            "streaming nothing is sent until the answer is complete, so this then limits "
+            "the whole run. Default: wait as long as it takes."
         ),
     )
     stream_group = parser.add_mutually_exclusive_group()
@@ -493,6 +567,7 @@ def write_summary_file(path: Path, metadata: dict[str, Any]) -> None:
         "Output",
         "Model",
         "Thinking",
+        "System prompt",
         "Options",
         "Runs",
         "Output tokens",
@@ -529,7 +604,8 @@ def write_summary_file(path: Path, metadata: dict[str, Any]) -> None:
             "Output tokens, tokens/s and time are averages over the runs that succeeded, and",
             "count thinking as well as the answer. Load is the longest model load time, which",
             "is usually the first run. Prompt tokens against Context shows how full the",
-            f"model's context window was. {MISSING} means the figure was not recorded.",
+            f"model's context window was. {MISSING} means the figure was not recorded. A system",
+            "prompt is shown by its opening words; each model file has it in full.",
             "",
         ]
     )
@@ -577,6 +653,9 @@ def summary_row(entry: dict[str, Any]) -> tuple[list[str], str]:
     options = entry.get("options") if isinstance(entry.get("options"), dict) else {}
     option_text = ", ".join(f"{key}={json.dumps(options[key])}" for key in sorted(options))
 
+    system = entry.get("system")
+    system_preview = prompt_preview(system, SUMMARY_SYSTEM_PREVIEW_CHARS) if system else ""
+
     loads = values("load_duration")
     prompt_tokens = values("prompt_eval_count")
     context_length = entry.get("context_length")
@@ -588,6 +667,7 @@ def summary_row(entry: dict[str, Any]) -> tuple[list[str], str]:
         f"[{output_name}]({output_name})" if output_name else MISSING,
         str(entry.get("model") or MISSING),
         think_label(entry["think"]) if "think" in entry else MISSING,
+        system_preview or "model default",
         option_text or "defaults",
         runs,
         average("eval_count"),
@@ -796,6 +876,18 @@ def text_file_records(text_files: list[dict[str, Any]]) -> list[dict[str, str]]:
     return [{key: item[key] for key in ("original_name", "sha256")} for item in text_files]
 
 
+def resolve_system(system_text: str | None, system_file: Path | None) -> str | None:
+    """Return the system prompt (``""`` for the model's own); ``None`` if unreadable."""
+    if system_file is None:
+        return (system_text or "").strip()
+
+    try:
+        return system_file.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"Could not read system prompt file {system_file}: {exc}", file=sys.stderr)
+        return None
+
+
 def resolve_prompt(prompt_file: Path | None) -> str | None:
     if prompt_file is None:
         return read_multiline_prompt()
@@ -809,7 +901,7 @@ def resolve_prompt(prompt_file: Path | None) -> str | None:
 
 def resolve_runs(requested_runs: int | None) -> int | None:
     if requested_runs is None:
-        return ask_positive_int("How many times should this prompt be run? ")
+        return ask_positive_int("How many times should this prompt be run? ", "--runs")
 
     if requested_runs > 0:
         return requested_runs
@@ -930,7 +1022,7 @@ def ask_optional_think(model: str, controls: dict[str, Any]) -> bool | str | Non
     )
 
     while True:
-        answer = parse_think_value(input(question))
+        answer = parse_think_value(ask(question, "--think"))
         if answer is None or not values:
             return answer
         if isinstance(answer, bool):
@@ -945,7 +1037,9 @@ def ask_optional_think(model: str, controls: dict[str, Any]) -> bool | str | Non
 
 def resolve_stream(requested_stream: bool | None) -> bool:
     if requested_stream is None:
-        return ask_yes_no("Stream responses from /api/generate?", default=False)
+        return ask_yes_no(
+            "Stream responses from /api/generate?", "--stream or --no-stream", default=False
+        )
     return requested_stream
 
 
@@ -990,7 +1084,7 @@ def choose_models(models: list[str]) -> list[str]:
         f"Enter one or more numbers (e.g. 1,3), or '{ALL_MODELS}': "
     )
     while True:
-        answer = input(question).strip().lower()
+        answer = ask(question, "--model").strip().lower()
         if answer == ALL_MODELS:
             return generating_models(models)
 
@@ -1001,17 +1095,25 @@ def choose_models(models: list[str]) -> list[str]:
         print(f"Enter model numbers from the list, or '{ALL_MODELS}'.")
 
 
-def ask_positive_int(question: str) -> int:
+def ask(question: str, flag: str) -> str:
+    """Ask a question, naming the flag that answers it if no input is available."""
+    try:
+        return input(question)
+    except EOFError:
+        raise InputEnded(flag) from None
+
+
+def ask_positive_int(question: str, flag: str) -> int:
     while True:
-        answer = input(question).strip()
+        answer = ask(question, flag).strip()
         if answer.isdigit() and int(answer) > 0:
             return int(answer)
         print("Enter a positive whole number.")
 
 
-def ask_optional_float(question: str) -> float | None:
+def ask_optional_float(question: str, flag: str) -> float | None:
     while True:
-        answer = input(question).strip()
+        answer = ask(question, flag).strip()
         if not answer:
             return None
         try:
@@ -1026,10 +1128,10 @@ def ask_optional_float(question: str) -> float | None:
         print("Enter a finite number, or press Enter for the default.")
 
 
-def ask_yes_no(question: str, default: bool = False) -> bool:
+def ask_yes_no(question: str, flag: str, default: bool = False) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
     while True:
-        answer = input(f"{question} {suffix} ").strip().lower()
+        answer = ask(f"{question} {suffix} ", flag).strip().lower()
         if not answer:
             return default
         if answer in {"y", "yes"}:
@@ -1047,7 +1149,7 @@ def ask_optional_temperature() -> float | None:
     )
 
     while True:
-        temperature = ask_optional_float(question)
+        temperature = ask_optional_float(question, "--temperature")
         if temperature is None:
             return None
         if TEMPERATURE_MIN <= temperature <= TEMPERATURE_MAX:
@@ -1129,6 +1231,8 @@ def generate_once(
     stream: bool = False,
     think: bool | str | None = None,
     images: list[str] | None = None,
+    system: str | None = None,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     generated_at = now_local()
@@ -1144,13 +1248,17 @@ def generate_once(
         request_payload["think"] = think
     if images:
         request_payload["images"] = images
+    if system:
+        request_payload["system"] = system
 
     try:
         if stream:
-            response_payload = ollama_post_stream_json("/api/generate", request_payload)
+            response_payload = ollama_post_stream_json(
+                "/api/generate", request_payload, timeout=timeout
+            )
             print()
         else:
-            response_payload = ollama_post_json("/api/generate", request_payload)
+            response_payload = ollama_post_json("/api/generate", request_payload, timeout=timeout)
         elapsed = time.monotonic() - started
         return {
             "ok": True,
@@ -1174,10 +1282,15 @@ def generate_once(
 
 def ollama_get_json(path: str) -> dict[str, Any]:
     request = urllib.request.Request(f"{OLLAMA_HOST}{path}", method="GET")
-    return open_json_request(request)
+    return open_json_request(request, QUICK_TIMEOUT_SECONDS)
 
 
-def ollama_post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+def ollama_post_json(
+    path: str,
+    payload: dict[str, Any],
+    timeout: float | None = QUICK_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """POST to Ollama and return its JSON reply. ``timeout=None`` waits indefinitely."""
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         f"{OLLAMA_HOST}{path}",
@@ -1185,13 +1298,14 @@ def ollama_post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         method="POST",
         headers={"Content-Type": "application/json"},
     )
-    return open_json_request(request)
+    return open_json_request(request, timeout)
 
 
 def ollama_post_stream_json(
     path: str,
     payload: dict[str, Any],
     response_output: TextIO | None = None,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -1211,7 +1325,7 @@ def ollama_post_stream_json(
     final_chunk: dict[str, Any] | None = None
     saw_chunk = False
     try:
-        with urllib.request.urlopen(request, timeout=600) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             for line_number, raw_line in enumerate(response, start=1):
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
@@ -1225,6 +1339,8 @@ def ollama_post_stream_json(
 
                 if not isinstance(chunk, dict):
                     raise RuntimeError(f"streaming JSON line {line_number} was not an object")
+                if chunk.get("error"):
+                    raise RuntimeError(str(chunk["error"]))
 
                 saw_chunk = True
                 # Thinking models send their reasoning in ``thinking`` chunks
@@ -1250,16 +1366,13 @@ def ollama_post_stream_json(
                 final_chunk = chunk
                 if chunk.get("done"):
                     break
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(str(exc.reason)) from exc
-    except TimeoutError as exc:
-        raise RuntimeError("request timed out") from exc
+    except (OSError, http.client.HTTPException) as exc:
+        raise RuntimeError(describe_request_error(exc, timeout)) from exc
 
     if not saw_chunk or final_chunk is None:
         raise RuntimeError("empty streaming response")
+    if not final_chunk.get("done"):
+        raise RuntimeError("the response stream ended before Ollama finished")
 
     stream_payload = dict(final_chunk)
     stream_payload["response"] = response_buffer.getvalue()
@@ -1275,17 +1388,30 @@ def is_terminal(stream: TextIO) -> bool:
         return False
 
 
-def open_json_request(request: urllib.request.Request) -> dict[str, Any]:
-    try:
-        with urllib.request.urlopen(request, timeout=600) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
+def describe_request_error(exc: BaseException, timeout: float | None) -> str:
+    """Put a failed request to Ollama into words."""
+    if isinstance(exc, urllib.error.HTTPError):
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(str(exc.reason)) from exc
-    except TimeoutError as exc:
-        raise RuntimeError("request timed out") from exc
+        return f"HTTP {exc.code}: {detail}"
+
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    # socket.timeout only became an alias of TimeoutError in Python 3.10.
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        waited = f" within {timeout:g} seconds" if timeout else ""
+        return f"no response from Ollama{waited}"
+    if isinstance(exc, urllib.error.URLError):
+        return str(reason)
+    return f"the connection to Ollama failed: {exc!r}"
+
+
+def open_json_request(
+    request: urllib.request.Request, timeout: float | None
+) -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except (OSError, http.client.HTTPException) as exc:
+        raise RuntimeError(describe_request_error(exc, timeout)) from exc
 
     try:
         return json.loads(body)
@@ -1354,6 +1480,7 @@ def write_model_output_file(
     images: list[dict[str, Any]] | None = None,
     text_files: list[dict[str, Any]] | None = None,
     context_length: int | None = None,
+    system: str | None = None,
 ) -> None:
     runs = str(len(results))
     if runs_requested is not None and len(results) < runs_requested:
@@ -1379,7 +1506,10 @@ def write_model_output_file(
         lines.append(f"Text files: {names} (sent ahead of the prompt; full text in `prompt.md`)")
     if images:
         lines.append("Images: " + ", ".join(f"`{image['file']}`" for image in images))
-    lines.extend(["", "## Prompt", "", markdown_fence_block(prompt, "text"), ""])
+    lines.append("")
+    if system:
+        lines.extend(["## System prompt", "", markdown_fence_block(system, "text"), ""])
+    lines.extend(["## Prompt", "", markdown_fence_block(prompt, "text"), ""])
     for image in images or []:
         lines.extend([f"![{image['file']}]({image['file']})", ""])
 
