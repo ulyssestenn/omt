@@ -55,6 +55,8 @@ can ignore them entirely.
 If a question comes up when there is no way to answer it, such as a scheduled
 run that left out `--runs`, the tool stops and names the flag to add.
 
+The program can list its own flags too: run `python3 ollama_model_test.py --help`.
+
 | Flag | Description |
 | --- | --- |
 | `--model NAME` | Local model to use (must already be installed). Repeat it to run several models, or pass `all` for every local model that can generate text |
