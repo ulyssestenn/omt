@@ -83,6 +83,15 @@ SAVED_METADATA_OMIT_KEYS = frozenset({"context", "response", "thinking"})
 
 # ``--model all`` (or answering "all" interactively) selects every local model.
 ALL_MODELS = "all"
+
+# How the start of a file identifies it as an image Ollama may be able to read.
+# Anything else has to be UTF-8 text, which is sent as part of the prompt.
+IMAGE_SIGNATURES = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+)
 EXIT_INTERRUPTED = 130
 
 
@@ -115,9 +124,14 @@ def main(argv: list[str] | None = None) -> int:
         print("No prompt entered. Exiting.")
         return 1
 
-    images = load_images(args.image or [])
-    if images is None:
+    # Files are asked about as part of typing the prompt; a prompt read from a
+    # file gets only the files named with --file.
+    attachments = resolve_attachments(args.file, ask=args.prompt_file is None)
+    if attachments is None:
         return 1
+    images = [item for item in attachments if item["kind"] == "image"]
+    text_files = [item for item in attachments if item["kind"] == "text"]
+    full_prompt = compose_prompt(prompt, text_files)
     if images:
         models = models_accepting_images(models)
         if not models:
@@ -139,13 +153,13 @@ def main(argv: list[str] | None = None) -> int:
 
     stream = resolve_stream(args.stream)
 
-    run_dir = create_prompt_run_dir(prompt, images)
+    run_dir = create_prompt_run_dir(prompt, images, text_files)
     prompt_path = run_dir / "prompt.md"
     metadata_path = run_dir / "metadata.json"
 
     copy_images(run_dir, images)
     if not prompt_path.exists():
-        write_prompt_file(prompt_path, prompt, now_local(), images)
+        write_prompt_file(prompt_path, prompt, now_local(), images, text_files)
 
     print()
     print(f"Saving results to: {run_dir}")
@@ -164,7 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Run {index}/{runs} using {model}...")
             try:
                 result = generate_once(
-                    model, prompt, options, stream=stream, think=think, images=encoded_images
+                    model, full_prompt, options, stream=stream, think=think, images=encoded_images
                 )
             except KeyboardInterrupt:
                 interrupted = True
@@ -191,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
                 runs_requested=runs,
                 digest=digest,
                 images=images,
+                text_files=text_files,
             )
             save_metadata_run(
                 metadata_path,
@@ -211,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
                 prompt,
                 prompt_path.name,
                 images,
+                text_files,
             )
 
         if results:
@@ -243,13 +259,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--file",
         "--image",
+        dest="file",
         action="append",
         type=Path,
         metavar="PATH",
         help=(
-            "Image file to send with the prompt, for vision models. "
-            "Repeat the flag to attach several images."
+            "File to add to the prompt. Images go to vision models; text and code files "
+            "are included in the prompt text. Repeat the flag to attach several files. "
+            "If omitted, you are asked when you type the prompt interactively."
         ),
     )
     parser.add_argument(
@@ -343,29 +362,128 @@ def models_accepting_images(models: list[str]) -> list[str]:
     return accepted
 
 
-def load_images(paths: list[Path]) -> list[dict[str, Any]] | None:
-    """Read the image files to attach; ``None`` if any of them can't be used."""
-    images: list[dict[str, Any]] = []
-    for index, image_path in enumerate(paths, start=1):
-        try:
-            data = image_path.read_bytes()
-        except OSError as exc:
-            print(f"Could not read image file {image_path}: {exc}", file=sys.stderr)
-            return None
-        if not data:
-            print(f"Image file is empty: {image_path}", file=sys.stderr)
-            return None
+def resolve_attachments(
+    requested_files: list[Path] | None, ask: bool
+) -> list[dict[str, Any]] | None:
+    """Load the files to send with the prompt; ``None`` if a requested one is unusable."""
+    if requested_files:
+        attachments: list[dict[str, Any]] = []
+        for file_path in requested_files:
+            try:
+                attachments.append(load_attachment(file_path, attachments))
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                return None
+        return attachments
 
-        extension = re.sub(r"[^a-z0-9.]", "", image_path.suffix.lower())
-        images.append(
-            {
-                "file": f"image-{index}{extension}",
-                "original_name": image_path.name,
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "data": data,
-            }
+    return ask_attachments() if ask else []
+
+
+def ask_attachments() -> list[dict[str, Any]]:
+    print()
+    print("Add files to the prompt? Images, text and code files all work.")
+    attachments: list[dict[str, Any]] = []
+    question = "Path to a file, or press Enter to continue: "
+    while True:
+        try:
+            answer = input(question)
+        except EOFError:
+            return attachments
+        file_path = typed_path(answer)
+        if file_path is None:
+            return attachments
+
+        try:
+            attachment = load_attachment(file_path, attachments)
+        except ValueError as exc:
+            print(exc)
+            continue
+        attachments.append(attachment)
+        print(f"  Added {attachment['original_name']} ({attachment_summary(attachment)})")
+        question = "Path to another file, or press Enter to continue: "
+
+
+def typed_path(answer: str) -> Path | None:
+    """Turn a typed, pasted or dragged-in path into a ``Path``; ``None`` if blank."""
+    text = answer.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1]
+    if not text:
+        return None
+
+    file_path = Path(text).expanduser()
+    if not file_path.exists() and os.name != "nt" and "\\" in text:
+        # Terminals escape spaces and the like when a file is dragged in.
+        unescaped = Path(re.sub(r"\\(.)", r"\1", text)).expanduser()
+        if unescaped.exists():
+            return unescaped
+    return file_path
+
+
+def load_attachment(file_path: Path, earlier: list[dict[str, Any]]) -> dict[str, Any]:
+    """Read one file as an image or as text. Raises ``ValueError`` if it is neither."""
+    try:
+        data = file_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"Could not read file {file_path}: {exc}") from exc
+    if not data:
+        raise ValueError(f"File is empty: {file_path}")
+
+    attachment: dict[str, Any] = {
+        "original_name": file_path.name,
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+    extension = image_extension(data)
+    if extension:
+        number = sum(1 for item in earlier if item["kind"] == "image") + 1
+        attachment.update(kind="image", file=f"image-{number}{extension}", data=data)
+        return attachment
+
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = ""
+    if not text or "\x00" in text:
+        raise ValueError(
+            f"Cannot add {file_path}: it is neither an image (PNG, JPEG, WebP, GIF) "
+            "nor UTF-8 text."
         )
-    return images
+    attachment.update(kind="text", text=text)
+    return attachment
+
+
+def image_extension(data: bytes) -> str:
+    """Return the extension for image data, or ``""`` if it isn't a known image."""
+    for signature, extension in IMAGE_SIGNATURES:
+        if data.startswith(signature):
+            return extension
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ""
+
+
+def attachment_summary(attachment: dict[str, Any]) -> str:
+    if attachment["kind"] == "image":
+        return "image"
+    return f"text, {len(attachment['text']):,} characters"
+
+
+def compose_prompt(prompt: str, text_files: list[dict[str, Any]] | None) -> str:
+    """Return the text sent to the model: any text files, then the prompt.
+
+    The prompt goes last because Ollama drops the start of the input when it
+    doesn't fit the model's context window, and the question matters most.
+    """
+    if not text_files:
+        return prompt
+
+    parts = [
+        f"File: {item['original_name']}\n{markdown_fence_block(item['text'].rstrip())}"
+        for item in text_files
+    ]
+    parts.append(prompt)
+    return "\n\n".join(parts)
 
 
 def copy_images(run_dir: Path, images: list[dict[str, Any]]) -> None:
@@ -380,6 +498,10 @@ def image_records(images: list[dict[str, Any]]) -> list[dict[str, str]]:
     return [
         {key: image[key] for key in ("file", "original_name", "sha256")} for image in images
     ]
+
+
+def text_file_records(text_files: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [{key: item[key] for key in ("original_name", "sha256")} for item in text_files]
 
 
 def resolve_prompt(prompt_file: Path | None) -> str | None:
@@ -645,9 +767,13 @@ def ask_optional_temperature() -> float | None:
         )
 
 
-def create_prompt_run_dir(prompt: str, images: list[dict[str, Any]] | None = None) -> Path:
+def create_prompt_run_dir(
+    prompt: str,
+    images: list[dict[str, Any]] | None = None,
+    text_files: list[dict[str, Any]] | None = None,
+) -> Path:
     slug = prompt_slug(prompt)
-    digest = prompt_hash(prompt, images)[:8]
+    digest = prompt_hash(prompt, images, text_files)[:8]
     run_dir = OUTPUT_ROOT / f"{slug}_{digest}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
@@ -667,13 +793,18 @@ def prompt_preview(prompt: str, max_chars: int = 160) -> str:
     return compact[: max_chars - 3].rstrip() + "..."
 
 
-def prompt_hash(prompt: str, images: list[dict[str, Any]] | None = None) -> str:
-    """Hash the prompt text, plus any attached images in the order they are sent.
+def prompt_hash(
+    prompt: str,
+    images: list[dict[str, Any]] | None = None,
+    text_files: list[dict[str, Any]] | None = None,
+) -> str:
+    """Hash everything sent to the model: the text, then any images in order.
 
-    A text-only prompt hashes to the plain SHA-256 of its text, so folders made
-    before images were supported keep their names.
+    A prompt with no files hashes to the plain SHA-256 of its text, so folders
+    made before files were supported keep their names.
     """
-    text_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    text = compose_prompt(prompt, text_files)
+    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
     if not images:
         return text_hash
     parts = [text_hash] + [image["sha256"] for image in images]
@@ -875,16 +1006,22 @@ def write_prompt_file(
     prompt: str,
     started_at: dt.datetime,
     images: list[dict[str, Any]] | None = None,
+    text_files: list[dict[str, Any]] | None = None,
 ) -> None:
     lines = [
         "# Prompt",
         "",
         f"Date: {started_at.isoformat()}",
-        f"Prompt hash: `{prompt_hash(prompt, images)}`",
+        f"Prompt hash: `{prompt_hash(prompt, images, text_files)}`",
         "",
         markdown_fence_block(prompt, "text"),
         "",
     ]
+    if text_files:
+        lines.extend(["## Text files", ""])
+        for item in text_files:
+            lines.append(f"- `{item['original_name']}` (SHA-256 `{item['sha256']}`)")
+        lines.append("")
     if images:
         lines.extend(["## Images", ""])
         for image in images:
@@ -897,6 +1034,17 @@ def write_prompt_file(
                     "",
                 ]
             )
+    if text_files:
+        lines.extend(
+            [
+                "## Text sent to the model",
+                "",
+                "The text files, followed by the prompt:",
+                "",
+                markdown_fence_block(compose_prompt(prompt, text_files), "text"),
+                "",
+            ]
+        )
     write_text_atomic(path, "\n".join(lines))
 
 
@@ -912,6 +1060,7 @@ def write_model_output_file(
     runs_requested: int | None = None,
     digest: str = "",
     images: list[dict[str, Any]] | None = None,
+    text_files: list[dict[str, Any]] | None = None,
 ) -> None:
     runs = str(len(results))
     if runs_requested is not None and len(results) < runs_requested:
@@ -923,13 +1072,16 @@ def write_model_output_file(
     lines.extend(
         [
             f"Date: {started_at.isoformat()}",
-            f"Prompt hash: `{prompt_hash(prompt, images)}`",
+            f"Prompt hash: `{prompt_hash(prompt, images, text_files)}`",
             f"Runs: {runs}",
             f"Options: `{json.dumps(options, sort_keys=True)}`",
             f"Thinking: `{think_label(think)}`",
             f"Streaming: `{stream}`",
         ]
     )
+    if text_files:
+        names = ", ".join(f"`{item['original_name']}`" for item in text_files)
+        lines.append(f"Text files: {names} (sent ahead of the prompt; full text in `prompt.md`)")
     if images:
         lines.append("Images: " + ", ".join(f"`{image['file']}`" for image in images))
     lines.extend(["", "## Prompt", "", markdown_fence_block(prompt, "text"), ""])
@@ -992,6 +1144,7 @@ def save_metadata_run(
     prompt: str,
     prompt_file_name: str,
     images: list[dict[str, Any]] | None = None,
+    text_files: list[dict[str, Any]] | None = None,
 ) -> None:
     """Add a run entry to ``metadata.json``, or update it if it is already there.
 
@@ -1021,7 +1174,7 @@ def save_metadata_run(
         runs.append(run_payload)
 
     metadata = {
-        "prompt_hash": prompt_hash(prompt, images),
+        "prompt_hash": prompt_hash(prompt, images, text_files),
         "prompt_preview": prompt_preview(prompt),
         "files": {
             "prompt": prompt_file_name,
@@ -1030,6 +1183,8 @@ def save_metadata_run(
     }
     if images:
         metadata["images"] = image_records(images)
+    if text_files:
+        metadata["text_files"] = text_file_records(text_files)
 
     write_text_atomic(path, json.dumps(metadata, indent=2, sort_keys=True) + "\n")
 
