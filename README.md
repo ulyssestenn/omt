@@ -32,7 +32,7 @@ You'll be asked, in order:
    terminal), one per line; press Enter on an empty line to move on. See
    [Files](#files)
 4. **How many times** to run the prompt
-5. **Temperature** (`0.0`–`2.0`), or press Enter to use Ollama's default
+5. **Temperature** (`0.0`–`2.0`), or press Enter to use the model's default
 6. **Thinking** — only asked for models that support it (qwen3, deepseek-r1,
    gpt-oss, …), once per such model. The choices come from the model itself:
    on/off for some, levels such as low/medium/high for others. Press Enter for

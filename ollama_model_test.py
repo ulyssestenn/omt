@@ -66,7 +66,6 @@ OLLAMA_HOST = resolve_ollama_host(os.environ.get("OLLAMA_HOST"))
 OUTPUT_ROOT = Path("ollama-runs")
 TEMPERATURE_MIN = 0.0
 TEMPERATURE_MAX = 2.0
-TEMPERATURE_DEFAULT = 0.8
 INVALID_TEMPERATURE = object()
 
 # Spellings accepted for the on/off/default forms of Ollama's ``think`` request
@@ -343,7 +342,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         help=(
             f"Generation temperature ({TEMPERATURE_MIN:.1f} to {TEMPERATURE_MAX:.1f}). "
-            "If omitted, choose interactively or press Enter for Ollama's default."
+            "If omitted, choose interactively or press Enter for the model's default."
         ),
     )
     parser.add_argument(
@@ -1044,7 +1043,7 @@ def ask_yes_no(question: str, default: bool = False) -> bool:
 def ask_optional_temperature() -> float | None:
     question = (
         f"Temperature to use ({TEMPERATURE_MIN:.1f} to {TEMPERATURE_MAX:.1f}), "
-        f"or press Enter for Ollama default ({TEMPERATURE_DEFAULT:.1f}): "
+        "or press Enter for the model's default: "
     )
 
     while True:
