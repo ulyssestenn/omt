@@ -1,9 +1,9 @@
 # Ollama Model Tester
 
 A small, dependency-free CLI for running the same prompt — optionally with
-images, text or code files — against your local [Ollama](https://ollama.com)
-models and saving every response to disk, so you can compare models (or compare
-repeated runs of one model) side by side.
+images or text files such as code, Markdown, CSV or JSON — against your local
+[Ollama](https://ollama.com) models and saving every response to disk, so you
+can compare models (or compare repeated runs of one model) side by side.
 
 It uses only the Python standard library: no `pip install` required.
 
@@ -225,8 +225,8 @@ What a program wrapped around the tool may notice:
 - **Over-long prompts fail** instead of being silently cut down. See
   [When the input is too large](#when-the-input-is-too-large).
 - **No ten-minute limit on a run.** `--timeout 600` restores the old behaviour.
-- **`summary.md` is a new file** in each prompt folder, and attached images are
-  copied in. To find the model output files, read `files.model_output` from the
+- **`summary.md` is a new file** in each prompt folder, and files sent with the
+  prompt are copied into a `files/` subfolder. To find the model output files, read `files.model_output` from the
   entries in `metadata.json` rather than listing `*.md`.
 - **Thinking models** have their reasoning under a `### Thinking` heading with
   the answer under `### Response`. Other models' files are laid out as before,
@@ -259,7 +259,9 @@ ollama-runs/
     metadata.json     # every run against this prompt (model, timing, options)
     llama3.1-8b.md    # responses + Ollama metadata for this model
     gemma3-1b.md
-    image-1.png       # copies of any attached images
+    files/            # copies of any files sent with the prompt
+      chart.png
+      notes.md
 ```
 
 The folder name is the first few words of the prompt plus a short hash of the
@@ -270,17 +272,18 @@ response alongside Ollama's run metadata (token counts, timings, and so on).
 
 `summary.md` is rewritten after every run. It has one row for each model file
 in the folder, including ones from earlier sessions, with the settings used
-(thinking, system prompt, options), output tokens, tokens per second, time, model load time, and how much of the
-context window the prompt took. Runs whose input did not fit, or whose answer
-was cut short, are called out under the table. Rows for results saved by older versions of the tool show
-`–` where the figures were not recorded.
+(thinking, system prompt, options), output tokens, tokens per second, time,
+model load time, and how much of the context window the prompt took. Runs whose
+input did not fit, or whose answer was cut short, are called out under the
+table. Rows for results saved by older versions of the tool show `–` where the
+figures were not recorded.
 
 Added files count as part of the prompt: the hash covers them too, so the same
-question about a different picture or document gets its own folder. Images are
-copied into the folder (as `image-1.png`, `image-2.jpg`, … in the order given).
-Text files are not copied separately; `prompt.md` holds the complete text that
-was sent, files included. Each file's original name and SHA-256 hash is listed
-in `prompt.md` and `metadata.json`.
+question about a different picture or document gets its own folder. Every file,
+image or text, is copied once into the folder's `files/` subfolder under its own
+name (numbered if two share a name). The Markdown output only links to those
+copies, so a large document does not swell `prompt.md` or the model files. Each
+file's name and SHA-256 hash is listed in `prompt.md` and `metadata.json`.
 
 Each model's digest is recorded in its file and in `metadata.json`. Tags such
 as `llama3.1:8b` can point at a different build after an `ollama pull`; the

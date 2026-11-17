@@ -143,12 +143,10 @@ ALL_MODELS = "all"
 
 # How the start of a file identifies it as an image Ollama may be able to read.
 # Anything else has to be UTF-8 text, which is sent as part of the prompt.
-IMAGE_SIGNATURES = (
-    (b"\x89PNG\r\n\x1a\n", ".png"),
-    (b"\xff\xd8\xff", ".jpg"),
-    (b"GIF87a", ".gif"),
-    (b"GIF89a", ".gif"),
-)
+IMAGE_SIGNATURES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
+
+# Subfolder of a prompt's folder that holds copies of the files sent with it.
+ATTACHMENTS_DIR = "files"
 EXIT_INTERRUPTED = 130
 
 
@@ -262,7 +260,7 @@ def run(args: argparse.Namespace) -> int:
     prompt_path = run_dir / "prompt.md"
     metadata_path = run_dir / "metadata.json"
 
-    copy_images(run_dir, images)
+    copy_attachments(run_dir, attachments)
     if not prompt_path.exists():
         write_prompt_file(prompt_path, prompt, now_local(), images, text_files)
 
@@ -842,7 +840,7 @@ def resolve_attachments(
 
 def ask_attachments() -> list[dict[str, Any]]:
     print()
-    print("Add files to the prompt? Images, text and code files all work.")
+    print("Add files to the prompt? Images and text files (code, Markdown, CSV, ...) work.")
     attachments: list[dict[str, Any]] = []
     question = "Path to a file, or press Enter to continue: "
     while True:
@@ -892,13 +890,13 @@ def load_attachment(file_path: Path, earlier: list[dict[str, Any]]) -> dict[str,
 
     attachment: dict[str, Any] = {
         "original_name": file_path.name,
+        "file": f"{ATTACHMENTS_DIR}/{copy_name(file_path.name, earlier)}",
         "sha256": hashlib.sha256(data).hexdigest(),
+        "data": data,
     }
 
-    extension = image_extension(data)
-    if extension:
-        number = sum(1 for item in earlier if item["kind"] == "image") + 1
-        attachment.update(kind="image", file=f"image-{number}{extension}", data=data)
+    if is_image(data):
+        attachment["kind"] = "image"
         return attachment
 
     try:
@@ -914,14 +912,21 @@ def load_attachment(file_path: Path, earlier: list[dict[str, Any]]) -> dict[str,
     return attachment
 
 
-def image_extension(data: bytes) -> str:
-    """Return the extension for image data, or ``""`` if it isn't a known image."""
-    for signature, extension in IMAGE_SIGNATURES:
-        if data.startswith(signature):
-            return extension
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return ".webp"
-    return ""
+def copy_name(name: str, earlier: list[dict[str, Any]]) -> str:
+    """Name for a file's saved copy: its own, numbered if an earlier file has it."""
+    taken = {Path(item["file"]).name.lower() for item in earlier}
+    stem, suffix = Path(name).stem, Path(name).suffix
+    candidate, number = name, 2
+    while candidate.lower() in taken:
+        candidate = f"{stem}-{number}{suffix}"
+        number += 1
+    return candidate
+
+
+def is_image(data: bytes) -> bool:
+    if data.startswith(IMAGE_SIGNATURES):
+        return True
+    return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
 
 
 def attachment_summary(attachment: dict[str, Any]) -> str:
@@ -947,22 +952,29 @@ def compose_prompt(prompt: str, text_files: list[dict[str, Any]] | None) -> str:
     return "\n\n".join(parts)
 
 
-def copy_images(run_dir: Path, images: list[dict[str, Any]]) -> None:
-    """Keep a copy of the attached images beside the prompt they belong to."""
-    for image in images:
-        destination = run_dir / image["file"]
+def copy_attachments(run_dir: Path, attachments: list[dict[str, Any]]) -> None:
+    """Keep a copy of the files sent with a prompt in its folder.
+
+    They are stored once, as files, so that a large document or image is not
+    repeated inside the Markdown output.
+    """
+    for item in attachments:
+        destination = run_dir / item["file"]
         if not destination.exists():
-            destination.write_bytes(image["data"])
+            destination.parent.mkdir(exist_ok=True)
+            destination.write_bytes(item["data"])
 
 
-def image_records(images: list[dict[str, Any]]) -> list[dict[str, str]]:
+def attachment_records(attachments: list[dict[str, Any]]) -> list[dict[str, str]]:
     return [
-        {key: image[key] for key in ("file", "original_name", "sha256")} for image in images
+        {key: item[key] for key in ("file", "original_name", "sha256")} for item in attachments
     ]
 
 
-def text_file_records(text_files: list[dict[str, Any]]) -> list[dict[str, str]]:
-    return [{key: item[key] for key in ("original_name", "sha256")} for item in text_files]
+def attachment_link(item: dict[str, Any]) -> str:
+    """Markdown link to a file's saved copy."""
+    label = Path(item["file"]).name.replace("[", "\\[").replace("]", "\\]")
+    return f"[{label}]({urllib.parse.quote(item['file'])})"
 
 
 def resolve_system(system_text: str | None, system_file: Path | None) -> str | None:
@@ -1544,33 +1556,35 @@ def write_prompt_file(
         "",
     ]
     if text_files:
-        lines.extend(["## Text files", ""])
-        for item in text_files:
-            lines.append(f"- `{item['original_name']}` (SHA-256 `{item['sha256']}`)")
-        lines.append("")
-    if images:
-        lines.extend(["## Images", ""])
-        for image in images:
-            lines.extend(
-                [
-                    f"- `{image['file']}` (original name `{image['original_name']}`, "
-                    f"SHA-256 `{image['sha256']}`)",
-                    "",
-                    f"  ![{image['file']}]({image['file']})",
-                    "",
-                ]
-            )
-    if text_files:
         lines.extend(
             [
-                "## Text sent to the model",
+                "## Text files",
                 "",
-                "The text files, followed by the prompt:",
-                "",
-                markdown_fence_block(compose_prompt(prompt, text_files), "text"),
+                "Sent as part of the prompt text, ahead of the prompt above and in this order,",
+                "each as a line reading `File: <name>` followed by its contents in a code block.",
+                f"Copies are in `{ATTACHMENTS_DIR}/`.",
                 "",
             ]
         )
+        for item in text_files:
+            copy = Path(item["file"]).name
+            sent_as = "" if copy == item["original_name"] else f"sent as `{item['original_name']}`, "
+            lines.append(
+                f"- {attachment_link(item)} ({sent_as}{len(item['text']):,} characters, "
+                f"SHA-256 `{item['sha256']}`)"
+            )
+        lines.append("")
+    if images:
+        lines.extend(["## Images", "", f"Sent as images. Copies are in `{ATTACHMENTS_DIR}/`.", ""])
+        for image in images:
+            lines.extend(
+                [
+                    f"- {attachment_link(image)} (SHA-256 `{image['sha256']}`)",
+                    "",
+                    f"  !{attachment_link(image)}",
+                    "",
+                ]
+            )
     write_text_atomic(path, "\n".join(lines))
 
 
@@ -1611,10 +1625,10 @@ def write_model_output_file(
     if context_length:
         lines.append(f"Context window: {context_length:,} tokens")
     if text_files:
-        names = ", ".join(f"`{item['original_name']}`" for item in text_files)
-        lines.append(f"Text files: {names} (sent ahead of the prompt; full text in `prompt.md`)")
+        links = ", ".join(attachment_link(item) for item in text_files)
+        lines.append(f"Text files: {links} (sent ahead of the prompt)")
     if images:
-        lines.append("Images: " + ", ".join(f"`{image['file']}`" for image in images))
+        lines.append("Images: " + ", ".join(attachment_link(image) for image in images))
     lines.append("")
     if system:
         lines.extend(["## System prompt", "", markdown_fence_block(system, "text"), ""])
@@ -1629,7 +1643,7 @@ def write_model_output_file(
         )
     lines.extend(["## Prompt", "", markdown_fence_block(prompt, "text"), ""])
     for image in images or []:
-        lines.extend([f"![{image['file']}]({image['file']})", ""])
+        lines.extend([f"!{attachment_link(image)}", ""])
 
     for index, result in enumerate(results, start=1):
         lines.extend(
@@ -1726,9 +1740,9 @@ def save_metadata_run(
         "runs": runs,
     }
     if images:
-        metadata["images"] = image_records(images)
+        metadata["images"] = attachment_records(images)
     if text_files:
-        metadata["text_files"] = text_file_records(text_files)
+        metadata["text_files"] = attachment_records(text_files)
 
     write_text_atomic(path, json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     return metadata
