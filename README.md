@@ -76,13 +76,15 @@ python3 ollama_model_test.py \
   --prompt-file prompt.txt \
   --runs 3 \
   --temperature 0.7 \
-  --think default \
   --no-stream
 ```
 
-`--think default` is only needed for thinking-capable models, where leaving it
-out triggers the thinking question. `--think` applies to every selected model
-that supports thinking and is left out for the ones that don't.
+The thinking question is only asked when the tool is already asking you
+something else. A command line that supplies the model, prompt file, runs,
+temperature and streaming choice, as above, never stops to ask, and
+thinking-capable models use their default unless you pass `--think`. `--think`
+applies to every selected model that supports thinking and is left out for the
+ones that don't.
 
 Example — compare every local model on the same prompt:
 
@@ -151,6 +153,11 @@ question, such as "You are a terse code reviewer" or "Answer only in French".
 Many models come with one built in. `--system` or `--system-file` replaces it
 for the run; leave them out and each model uses its own.
 
+Whichever one applied is saved in full with the results: yours, or the model's
+own as Ollama reports it. Some models carry their standing instructions inside
+their prompt template instead, which Ollama does not report as a system prompt
+and so is not captured.
+
 ```bash
 python3 ollama_model_test.py --model all --system "Answer in one sentence."
 ```
@@ -203,6 +210,31 @@ nothing arrives until the whole answer is done, so it limits the entire run.
 
 Listing models and looking up their details should take moments, so those
 calls give up after 30 seconds, and an unreachable Ollama is reported promptly.
+
+## Scripting and compatibility
+
+Command lines written for earlier versions keep working: the original flags
+mean what they did, a command that supplied all of them still runs without
+asking anything, the `Done. Wrote <file>` line is unchanged, prompt folders
+keep their names, and `metadata.json` only gained fields.
+
+What a program wrapped around the tool may notice:
+
+- **Over-long prompts fail** instead of being silently cut down. See
+  [When the input is too large](#when-the-input-is-too-large).
+- **No ten-minute limit on a run.** `--timeout 600` restores the old behaviour.
+- **`summary.md` is a new file** in each prompt folder, and attached images are
+  copied in. To find the model output files, read `files.model_output` from the
+  entries in `metadata.json` rather than listing `*.md`.
+- **Thinking models** have their reasoning under a `### Thinking` heading with
+  the answer under `### Response`. Other models' files are laid out as before,
+  with a few more header lines.
+- **`OLLAMA_HOST` is honoured**, so the tool follows it if it is set.
+- **Extra lines on the terminal**, such as failed runs' errors and the path to
+  the comparison table.
+
+The functions inside the script are not a stable interface; drive it through
+its command line.
 
 ## Using another host
 

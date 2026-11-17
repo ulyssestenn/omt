@@ -243,7 +243,18 @@ def run(args: argparse.Namespace) -> int:
     if temperature is not None:
         options["temperature"] = temperature
 
-    think_by_model = {model: resolve_think(args.think, model) for model in models}
+    # The thinking question is newer than the others. A command line that already
+    # answers all of those was written to run unattended, so it is not asked then.
+    unattended = (
+        bool(args.model)
+        and args.prompt_file is not None
+        and args.runs is not None
+        and args.temperature is not None
+        and args.stream is not None
+    )
+    think_by_model = {
+        model: resolve_think(args.think, model, ask=not unattended) for model in models
+    }
 
     stream = resolve_stream(args.stream)
 
@@ -264,6 +275,7 @@ def run(args: argparse.Namespace) -> int:
         think = think_by_model[model]
         digest = installed.get(model, "")
         output_path = unique_model_output_path(run_dir, model)
+        model_system = model_system_prompt(model)
         started_at = now_local()
         results: list[dict[str, Any]] = []
         context_length: int | None = None
@@ -338,6 +350,7 @@ def run(args: argparse.Namespace) -> int:
                 text_files=text_files,
                 context_length=context_length,
                 system=system,
+                model_system=model_system,
             )
             metadata = save_metadata_run(
                 metadata_path,
@@ -351,6 +364,7 @@ def run(args: argparse.Namespace) -> int:
                     "options": options,
                     "think": think,
                     "system": system or None,
+                    "model_system": model_system,
                     "stream": stream,
                     "context_length": context_length,
                     "results": [run_stats(item) for item in results],
@@ -371,7 +385,8 @@ def run(args: argparse.Namespace) -> int:
                 break
 
         if results:
-            print(f"Wrote {output_path}")
+            finished = len(results) == runs
+            print(f"Done. Wrote {output_path}" if finished else f"Wrote {output_path}")
         if interrupted:
             break
 
@@ -382,7 +397,7 @@ def run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return EXIT_INTERRUPTED
-    print(f"Done. Comparison table: {run_dir / SUMMARY_FILE_NAME}")
+    print(f"Comparison table: {run_dir / SUMMARY_FILE_NAME}")
     return 0
 
 
@@ -431,7 +446,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Thinking control for thinking-capable models: on, off, a level the model "
             "supports (such as low, medium or high), or default to leave it to the model. "
-            "If omitted, you are asked only when the model supports thinking."
+            "If omitted, you are asked when the model supports thinking, unless the other "
+            "questions were all answered by flags."
         ),
     )
     parser.add_argument(
@@ -655,7 +671,8 @@ def write_summary_file(path: Path, metadata: dict[str, Any]) -> None:
             "count thinking as well as the answer. Load is the longest model load time, which",
             "is usually the first run. Prompt tokens against Context shows how full the",
             f"model's context window was. {MISSING} means the figure was not recorded. A system",
-            "prompt is shown by its opening words; each model file has it in full.",
+            "prompt is shown by its opening words; each model file has it in full. \"model's",
+            "own\" is the one built into the model, used when none was given.",
             "",
         ]
     )
@@ -704,7 +721,15 @@ def summary_row(entry: dict[str, Any]) -> tuple[list[str], list[str]]:
     option_text = ", ".join(f"{key}={json.dumps(options[key])}" for key in sorted(options))
 
     system = entry.get("system")
-    system_preview = prompt_preview(system, SUMMARY_SYSTEM_PREVIEW_CHARS) if system else ""
+    model_system = entry.get("model_system")
+    if system:
+        system_label = prompt_preview(system, SUMMARY_SYSTEM_PREVIEW_CHARS)
+    elif model_system:
+        system_label = "model's own: " + prompt_preview(model_system, SUMMARY_SYSTEM_PREVIEW_CHARS)
+    elif model_system == "":
+        system_label = "none"
+    else:
+        system_label = "model default"
 
     loads = values("load_duration")
     prompt_tokens = values("prompt_eval_count")
@@ -717,7 +742,7 @@ def summary_row(entry: dict[str, Any]) -> tuple[list[str], list[str]]:
         f"[{output_name}]({output_name})" if output_name else MISSING,
         str(entry.get("model") or MISSING),
         think_label(entry["think"]) if "think" in entry else MISSING,
-        system_preview or "model default",
+        system_label,
         option_text or "defaults",
         runs,
         average("eval_count"),
@@ -992,7 +1017,9 @@ def resolve_temperature(requested_temperature: float | None) -> float | object |
     return INVALID_TEMPERATURE
 
 
-def resolve_think(requested_think: str | None, model: str) -> bool | str | None:
+def resolve_think(
+    requested_think: str | None, model: str, ask: bool = True
+) -> bool | str | None:
     """Return the ``think`` value to send, or ``None`` to leave it to the model."""
     controls = model_thinking_controls(model)
 
@@ -1003,7 +1030,7 @@ def resolve_think(requested_think: str | None, model: str) -> bool | str | None:
             return None
         return think
 
-    if controls is None:
+    if controls is None or not ask:
         return None
     return ask_optional_think(model, controls)
 
@@ -1041,6 +1068,15 @@ def model_info(model: str) -> dict[str, Any]:
         except RuntimeError:
             MODEL_INFO_CACHE[model] = {}
     return MODEL_INFO_CACHE[model]
+
+
+def model_system_prompt(model: str) -> str | None:
+    """The system prompt built into a model: ``""`` if none, ``None`` if unknown."""
+    info = model_info(model)
+    if not info:
+        return None
+    system = info.get("system")
+    return system.strip() if isinstance(system, str) else ""
 
 
 def model_supports(model: str, capability: str) -> bool | None:
@@ -1553,6 +1589,7 @@ def write_model_output_file(
     text_files: list[dict[str, Any]] | None = None,
     context_length: int | None = None,
     system: str | None = None,
+    model_system: str | None = None,
 ) -> None:
     runs = str(len(results))
     if runs_requested is not None and len(results) < runs_requested:
@@ -1581,6 +1618,15 @@ def write_model_output_file(
     lines.append("")
     if system:
         lines.extend(["## System prompt", "", markdown_fence_block(system, "text"), ""])
+    elif model_system:
+        lines.extend(
+            [
+                "## System prompt (the model's own)",
+                "",
+                markdown_fence_block(model_system, "text"),
+                "",
+            ]
+        )
     lines.extend(["## Prompt", "", markdown_fence_block(prompt, "text"), ""])
     for image in images or []:
         lines.extend([f"![{image['file']}]({image['file']})", ""])
