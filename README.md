@@ -114,10 +114,35 @@ than its name:
 - Anything else, such as a PDF or a Word document, is refused.
 
 Ollama has no separate channel for text files, so they count against the
-model's context window like any other prompt text. If a file is too large for
-it, Ollama silently drops the beginning of the input. Your prompt goes last so
-that it survives; compare `prompt_eval_count` in a run's metadata against the
-size of what you sent if the answers look like the model missed something.
+model's context window like any other prompt text. See
+[When the input is too large](#when-the-input-is-too-large) for what happens if
+they don't fit.
+
+## When the input is too large
+
+Every model has a context window: the amount of text, measured in tokens, it
+can hold at once. Left to itself, Ollama handles a prompt that is too big by
+silently dropping part of it and answering from what remains, which gives you
+an answer that looks normal but is based on only some of what you sent.
+
+This tool asks Ollama not to do that. If the prompt and its files do not fit,
+the run is stopped and recorded as failed, the terminal and `summary.md` both
+say why, and the model's remaining runs are skipped. To fix it, give the model
+a larger window and run again:
+
+```bash
+python3 ollama_model_test.py --file report.md --option num_ctx=16384
+```
+
+A larger window uses more memory, and each model has a maximum, so for a very
+large file the answer may be to send less of it.
+
+Two related cases are also flagged in the terminal and the summary:
+
+- An answer that stopped at a length limit, because the window filled up while
+  the model was writing or `num_predict` was reached. It is probably incomplete.
+- On older Ollama versions, which cut the input regardless, a prompt that
+  filled the entire window. The model probably did not see all of it.
 
 ## System prompt
 
@@ -151,7 +176,7 @@ The ones most likely to be useful:
 
 | Option | What it does | When to reach for it |
 | --- | --- | --- |
-| `num_ctx` | Size of the model's context window, in tokens: how much prompt plus answer it can hold at once | The tool tells you the prompt filled the context window, which happens with large files. Try `8192` or `16384`; bigger uses more memory |
+| `num_ctx` | Size of the model's context window, in tokens: how much prompt plus answer it can hold at once | The tool tells you the input did not fit, which happens with large files. Try `8192` or `16384`; bigger uses more memory |
 | `seed` | Fixes the randomness, so the same prompt and settings give the same answer | You want repeatable results, or a fair like-for-like rerun |
 | `num_predict` | Maximum number of tokens in the answer | A model rambles or never stops, or you want short answers |
 | `top_p`, `top_k` | Narrow or widen the range of words the model picks from | Fine-tuning variety beyond what temperature does |
@@ -212,9 +237,8 @@ response alongside Ollama's run metadata (token counts, timings, and so on).
 `summary.md` is rewritten after every run. It has one row for each model file
 in the folder, including ones from earlier sessions, with the settings used
 (thinking, system prompt, options), output tokens, tokens per second, time, model load time, and how much of the
-context window the prompt took. If a prompt filled the whole window, the
-summary and the terminal both say so, since the model then probably did not
-see all of the input. Rows for results saved by older versions of the tool show
+context window the prompt took. Runs whose input did not fit, or whose answer
+was cut short, are called out under the table. Rows for results saved by older versions of the tool show
 `–` where the figures were not recorded.
 
 Added files count as part of the prompt: the hash covers them too, so the same

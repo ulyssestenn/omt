@@ -126,6 +126,14 @@ RUN_STAT_KEYS = (
 # calls give up quickly. Generation has no time limit unless --timeout sets one:
 # a slow run that is still working is worth more than one cut off.
 QUICK_TIMEOUT_SECONDS = 30.0
+# Wording Ollama uses when it refuses input that is too long for the context
+# window, which it does (instead of cutting the input) when asked not to truncate.
+CONTEXT_ERROR_PHRASES = (
+    "context length",
+    "context size",
+    "context window",
+    "exceeds the available context",
+)
 SUMMARY_SYSTEM_PREVIEW_CHARS = 40
 SUMMARY_FILE_NAME = "summary.md"
 MISSING = "–"
@@ -260,6 +268,7 @@ def run(args: argparse.Namespace) -> int:
         results: list[dict[str, Any]] = []
         context_length: int | None = None
         warned_about_context = False
+        warned_about_length = False
 
         print()
         for index in range(1, runs + 1):
@@ -285,14 +294,31 @@ def run(args: argparse.Namespace) -> int:
             print(f"  {status} in {elapsed:.2f}s")
             if not result["ok"]:
                 print(f"  {result['error']}", file=sys.stderr)
-            elif context_length is None:
+            if context_length is None:
                 context_length = loaded_context_length(model, options)
-            if not warned_about_context and prompt_filled_context(result, context_length):
+
+            input_did_not_fit = is_context_error(result)
+            if input_did_not_fit:
+                size = f" ({context_length:,} tokens)" if context_length else ""
+                print(
+                    f"  The prompt and its files do not fit in {model}'s context window{size}. "
+                    "Nothing was cut: the run was stopped so that you don't get an answer "
+                    "based on only part of the input. Give the model more room with "
+                    "--option num_ctx=<a larger number>, or send less."
+                )
+            elif not warned_about_context and prompt_filled_context(result, context_length):
                 warned_about_context = True
                 print(
                     f"  Note: the prompt filled {model}'s whole context window "
                     f"({context_length:,} tokens), so the model probably did not see all "
                     "of it. Give it more room with --option num_ctx=<a larger number>."
+                )
+            if not warned_about_length and stopped_at_length(result):
+                warned_about_length = True
+                print(
+                    "  Note: this answer stopped at a length limit, so it is probably "
+                    "incomplete. Either the context window filled up (raise it with "
+                    "--option num_ctx=<a larger number>) or num_predict was reached."
                 )
 
             # Save after every run so an interruption or crash later on loses
@@ -338,6 +364,11 @@ def run(args: argparse.Namespace) -> int:
                 text_files,
             )
             write_summary_file(run_dir / SUMMARY_FILE_NAME, metadata)
+
+            if input_did_not_fit:
+                if index < runs:
+                    print("  Skipping this model's remaining runs: they would fail the same way.")
+                break
 
         if results:
             print(f"Wrote {output_path}")
@@ -539,8 +570,28 @@ def is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def is_context_error(result: dict[str, Any]) -> bool:
+    """Whether a run failed because its input was too long for the context window."""
+    if result.get("ok"):
+        return False
+    error = str(result.get("error") or "").lower()
+    return any(phrase in error for phrase in CONTEXT_ERROR_PHRASES)
+
+
+def stopped_at_length(result: dict[str, Any]) -> bool:
+    """Whether an answer ended because it hit a limit, not because it was finished."""
+    if not result.get("ok"):
+        return False
+    stats = result.get("raw", result)
+    return stats.get("done_reason") == "length"
+
+
 def prompt_filled_context(result: dict[str, Any], context_length: int | None) -> bool:
-    """Whether the prompt alone took up the whole context window, so was cut."""
+    """Whether the prompt alone took up the whole context window, so was cut.
+
+    Only older Ollama versions get this far: they ignore the request not to
+    truncate, and cut an over-long prompt down to exactly the window size.
+    """
     if not result.get("ok") or context_length is None:
         return False
     prompt_tokens = result["raw"].get("prompt_eval_count")
@@ -583,10 +634,9 @@ def write_summary_file(path: Path, metadata: dict[str, Any]) -> None:
     notes: list[str] = []
     for entry in metadata.get("runs", []):
         if isinstance(entry, dict):
-            row, note = summary_row(entry)
+            row, row_notes = summary_row(entry)
             rows.append(row)
-            if note:
-                notes.append(note)
+            notes.extend(row_notes)
 
     lines = [
         "# Summary",
@@ -614,8 +664,8 @@ def write_summary_file(path: Path, metadata: dict[str, Any]) -> None:
     write_text_atomic(path, "\n".join(lines))
 
 
-def summary_row(entry: dict[str, Any]) -> tuple[list[str], str]:
-    """Return the table cells for one metadata entry, plus a warning if it needs one."""
+def summary_row(entry: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Return the table cells for one metadata entry, plus any warnings about it."""
     files = entry.get("files") if isinstance(entry.get("files"), dict) else {}
     output_name = files.get("model_output") or ""
     results = entry.get("results") if isinstance(entry.get("results"), list) else []
@@ -680,14 +730,28 @@ def summary_row(entry: dict[str, Any]) -> tuple[list[str], str]:
         started or MISSING,
     ]
 
-    note = ""
-    if prompt_tokens and is_positive_int(context_length) and max(prompt_tokens) >= context_length:
-        note = (
-            f"**Input probably cut short in `{output_name}`:** the prompt filled the whole "
-            f"context window ({context_length:,} tokens). Give the model more room with "
-            "`--option num_ctx=<a larger number>`."
+    notes: list[str] = []
+    more_room = "Give the model more room with `--option num_ctx=<a larger number>`."
+    size = f" ({context_length:,} tokens)" if is_positive_int(context_length) else ""
+    if any(isinstance(item, dict) and is_context_error(item) for item in results):
+        notes.append(
+            f"**Input did not fit in `{output_name}`:** the prompt and its files were too "
+            f"large for the model's context window{size}, so the run was stopped instead of "
+            f"being answered from part of the input. {more_room}"
         )
-    return row, note
+    elif prompt_tokens and is_positive_int(context_length) and max(prompt_tokens) >= context_length:
+        notes.append(
+            f"**Input probably cut short in `{output_name}`:** the prompt filled the whole "
+            f"context window{size}. {more_room}"
+        )
+    cut_short = sum(1 for item in succeeded if stopped_at_length(item))
+    if cut_short:
+        notes.append(
+            f"**Answer cut short in `{output_name}`:** {cut_short} of {len(succeeded)} "
+            "answers stopped at a length limit, so they are probably incomplete. Either the "
+            "context window filled up or `num_predict` was reached."
+        )
+    return row, notes
 
 
 def resolve_models(requested_models: list[str] | None, installed: list[str]) -> list[str] | None:
@@ -1241,6 +1305,9 @@ def generate_once(
         "model": model,
         "prompt": prompt,
         "stream": stream,
+        # Have Ollama refuse input that is too long for the context window. By
+        # default it silently drops part of the prompt and answers from the rest.
+        "truncate": False,
     }
     if options:
         request_payload["options"] = options
@@ -1391,8 +1458,13 @@ def is_terminal(stream: TextIO) -> bool:
 def describe_request_error(exc: BaseException, timeout: float | None) -> str:
     """Put a failed request to Ollama into words."""
     if isinstance(exc, urllib.error.HTTPError):
-        detail = exc.read().decode("utf-8", errors="replace")
-        return f"HTTP {exc.code}: {detail}"
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        try:
+            # Ollama reports problems as {"error": "..."}; show just the message.
+            message = json.loads(detail)["error"]
+        except (ValueError, KeyError, TypeError):
+            message = detail
+        return f"HTTP {exc.code}: {message}"
 
     reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
     # socket.timeout only became an alias of TimeoutError in Python 3.10.
